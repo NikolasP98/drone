@@ -1,0 +1,31 @@
+{
+  "name": "@nikolasp98/drone",
+  "version": "0.1.0",
+  "description": "Middle-tier mini-agent primitive: isolated LLM call with own model, system prompt, tools, and skills. Sits between forcedToolCall and runEmbeddedPiAgent.",
+  "license": "MIT",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "type": "module",
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "scripts": {
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@mariozechner/pi-ai": "0.53.0",
+    "@sinclair/typebox": "0.34.48",
+    "typescript": "^5.5.0",
+    "vitest": "^3.2.4"
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-ai": "*",
+    "@sinclair/typebox": "*"
+  }
+}
