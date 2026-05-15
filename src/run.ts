@@ -135,7 +135,8 @@ export async function runDrone<TOut>(
   const baseOptions: ProviderStreamOptions = {
     apiKey,
     signal,
-    maxTokens: 1024,
+    maxTokens: input.maxTokens ?? 1024,
+    ...(input.temperature != null ? { temperature: input.temperature } : {}),
   };
 
   // Mode dispatch
@@ -157,7 +158,7 @@ export async function runDrone<TOut>(
       const msg = await complete(model, ctx, {
         ...baseOptions,
         toolChoice: { type: "tool", name: SCHEMA_TOOL_NAME },
-        maxTokens: 512,
+        maxTokens: input.maxTokens ?? 512,
       });
       usage = mergeUsage(usage, msg);
       const calls = findToolCalls(msg);

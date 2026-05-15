@@ -70,6 +70,10 @@ export type DroneRunInput = {
   /** Session / message id for telemetry correlation. */
   correlationId?: string;
   abortSignal?: AbortSignal;
+  /** Best-effort per-run override (provider-dependent). Defaults to 1024 (free-text) or 512 (schema-only). */
+  maxTokens?: number;
+  /** Best-effort per-run override (provider-dependent). */
+  temperature?: number;
 };
 
 export type DroneUsage = {

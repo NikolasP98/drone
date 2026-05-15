@@ -1,4 +1,3 @@
-import type { Static, TSchema } from "@sinclair/typebox";
 import type { Drone, DroneDefinition } from "./types.js";
 
 const ID_RE = /^[a-z][a-z0-9-]{1,63}$/;
@@ -8,14 +7,11 @@ const ID_RE = /^[a-z][a-z0-9-]{1,63}$/;
  * `runDrone` consumes; storing the definition this way prevents callers
  * from mutating tools/prompt/etc mid-run.
  *
- * If `def.output` is a TypeBox schema, the inferred Static is the drone's
- * output type. Otherwise the drone returns `string` (final assistant text).
+ * If `def.output` is a TypeBox schema, pass `Static<typeof Schema>` as the
+ * type parameter to infer the drone's output type. Otherwise the drone
+ * returns `string` (final assistant text).
  */
-export function defineDrone<TSchemaOut extends TSchema>(
-  def: DroneDefinition<Static<TSchemaOut>> & { output: TSchemaOut },
-): Drone<Static<TSchemaOut>>;
-export function defineDrone(def: DroneDefinition): Drone;
-export function defineDrone(def: DroneDefinition<unknown>): Drone<unknown> {
+export function defineDrone<TOut = string>(def: DroneDefinition<TOut>): Drone<TOut> {
   if (!ID_RE.test(def.id)) {
     throw new Error(`defineDrone: invalid id "${def.id}". Must match /^[a-z][a-z0-9-]{1,63}$/.`);
   }
@@ -37,5 +33,5 @@ export function defineDrone(def: DroneDefinition<unknown>): Drone<unknown> {
       names.add(t.name);
     }
   }
-  return Object.freeze({ definition: Object.freeze({ ...def }) }) as Drone<unknown>;
+  return Object.freeze({ definition: Object.freeze({ ...def }) }) as Drone<TOut>;
 }
