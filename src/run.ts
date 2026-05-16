@@ -9,6 +9,7 @@ import type {
 } from "@mariozechner/pi-ai";
 import type { TObject } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
+import { forceToolCallShape } from "./provider-shapes.js";
 import type {
   Drone,
   DroneError,
@@ -183,14 +184,21 @@ export async function runDrone<TOut>(
    * to DroneError.
    */
   let lockedCandidate: Candidate | null = null;
-  async function attemptComplete(extraOptions: Partial<ProviderStreamOptions> = {}): Promise<{
+  async function attemptComplete(
+    extraOptions: Partial<ProviderStreamOptions> & {
+      /** Tool name to force a single call against (translated per provider). */
+      forceSingleTool?: string;
+    } = {},
+  ): Promise<{
     msg: Awaited<ReturnType<typeof complete>>;
     resolvedModel: { provider: string; model: string };
   }> {
     // Once a candidate has answered for this run, stick with it for later
     // turns (tool-loop continuations) — switching mid-conversation would
     // break tool-call/result pairing.
+    const wasLocked = lockedCandidate != null;
     const pool = lockedCandidate ? [lockedCandidate] : candidates;
+    const { forceSingleTool, ...rawExtra } = extraOptions;
     let lastError: unknown;
     for (const cand of pool) {
       const m = getModel(cand.spec.provider as never, cand.spec.model as never) as Parameters<
@@ -202,11 +210,21 @@ export async function runDrone<TOut>(
           signal,
           maxTokens: input.maxTokens ?? 1024,
           ...(input.temperature != null ? { temperature: input.temperature } : {}),
-          ...extraOptions,
+          ...rawExtra,
         };
+        // Provider-specific toolChoice translation (Anthropic wants
+        // {type:"tool",name}, OpenAI/Google accept "required"). Only set when
+        // caller passed `forceSingleTool` — otherwise leave whatever extraOptions
+        // provided unchanged (free-text + tool-loop modes don't force a tool).
+        if (forceSingleTool) {
+          (opts as Record<string, unknown>).toolChoice = forceToolCallShape(
+            cand.spec.provider,
+            forceSingleTool,
+          );
+        }
         const msg = await complete(
           m,
-          { systemPrompt, messages, tools: extraOptions.tools as never },
+          { systemPrompt, messages, tools: rawExtra.tools as never },
           opts,
         );
         lockedCandidate = cand;
@@ -219,6 +237,15 @@ export async function runDrone<TOut>(
         // continue to next candidate
       }
     }
+    // Diagnostic: if we exhausted only the locked candidate, surface the
+    // fallback-was-disabled signal in the error message — easy to miss
+    // otherwise.
+    if (wasLocked && lockedCandidate) {
+      throw new Error(
+        `fallback exhausted: locked to ${lockedCandidate.spec.provider}/${lockedCandidate.spec.model} after first turn (cannot switch mid-conversation): ${String(lastError)}`,
+        { cause: lastError },
+      );
+    }
     throw lastError ?? new Error("all candidates failed");
   }
 
@@ -228,7 +255,7 @@ export async function runDrone<TOut>(
       // Schema-only mode
       const schema = def.output as TObject;
       const { msg, resolvedModel } = await attemptComplete({
-        toolChoice: { type: "tool", name: SCHEMA_TOOL_NAME },
+        forceSingleTool: SCHEMA_TOOL_NAME,
         maxTokens: input.maxTokens ?? 512,
         tools: [
           {
