@@ -63,8 +63,23 @@ export type DroneDefinition<TOut = string> = {
   readonly __out?: TOut;
 };
 
+/** Image input for drones — mirrors pi-ai's ImageContent. */
+export type DroneImageInput = {
+  /** Base64-encoded image bytes. */
+  data: string;
+  /** MIME type, e.g. "image/png", "image/jpeg". */
+  mimeType: string;
+};
+
 export type DroneRunInput = {
   prompt: string;
+  /**
+   * Optional image inputs sent alongside the prompt in the user message.
+   * Provider support varies — Anthropic/OpenAI/Google support vision models;
+   * text-only providers will reject. The drone does not validate; the
+   * provider's error surfaces through `UPSTREAM_ERROR`.
+   */
+  images?: DroneImageInput[];
   /** Optional variables interpolated into systemPrompt as {{key}}. */
   context?: Record<string, string | number | boolean>;
   /** Session / message id for telemetry correlation. */
@@ -139,6 +154,18 @@ export type DroneHost = {
    */
   emitEvent?(input: DroneEventInput): void;
 };
+
+/** Streaming events emitted by `runDroneStream`. */
+export type DroneStreamEvent =
+  | { type: "text"; delta: string }
+  | {
+      type: "done";
+      data: string;
+      usage: DroneUsage;
+      durationMs: number;
+      resolvedModel: { provider: string; model: string };
+    }
+  | { type: "error"; error: DroneError; durationMs: number };
 
 export type DroneEventInput = {
   event: "agent.run.start" | "agent.run.end" | "agent.run.error";

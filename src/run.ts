@@ -73,6 +73,29 @@ function findText(msg: AssistantMessage): string {
 }
 
 /**
+ * Build the user-message content for a drone call. Returns a plain string
+ * when no images are attached (most cases), or the mixed array form when
+ * images are present.
+ */
+function buildUserContent(
+  input: DroneRunInput,
+):
+  | string
+  | Array<{ type: "text"; text: string } | { type: "image"; data: string; mimeType: string }> {
+  if (!input.images || input.images.length === 0) {
+    return input.prompt;
+  }
+  return [
+    { type: "text" as const, text: input.prompt },
+    ...input.images.map((img) => ({
+      type: "image" as const,
+      data: img.data,
+      mimeType: img.mimeType,
+    })),
+  ];
+}
+
+/**
  * Execute a drone. Picks mode based on definition:
  *  - `output` set, no `tools` → schema-only (single forced tool call)
  *  - `tools` non-empty → tool-loop (multi-step in-process)
@@ -109,14 +132,37 @@ export async function runDrone<TOut>(
     return r;
   };
 
-  let apiKey: string;
-  try {
-    const resolved = await host.resolveApiKey(def.model);
-    apiKey = resolved.apiKey;
-  } catch (e) {
+  // Build candidate chain: primary + fallbacks (each with its own resolved auth).
+  // Skip a candidate if its credentials can't be resolved — never block the
+  // entire call on one bad profile.
+  type Candidate = {
+    spec: { provider: string; model: string };
+    apiKey: string;
+  };
+  const chain: Array<{ provider: string; model: string; authProfileId?: string }> = [
+    def.model,
+    ...(def.model.fallbacks ?? []),
+  ];
+  const candidates: Candidate[] = [];
+  const authErrors: string[] = [];
+  for (const entry of chain) {
+    try {
+      const auth = await host.resolveApiKey(entry);
+      candidates.push({
+        spec: { provider: entry.provider, model: entry.model },
+        apiKey: auth.apiKey,
+      });
+    } catch (e) {
+      authErrors.push(`${entry.provider}/${entry.model}: ${String(e)}`);
+    }
+  }
+  if (candidates.length === 0) {
     return finish({
       ok: false,
-      error: err("NO_API_KEY", `Failed to resolve api key: ${String(e)}`, e),
+      error: err(
+        "NO_API_KEY",
+        `Failed to resolve api key for any candidate (${authErrors.join("; ") || "no candidates"})`,
+      ),
       durationMs: Date.now() - started,
     }) as DroneRunResult<TOut>;
   }
@@ -126,39 +172,71 @@ export async function runDrone<TOut>(
     .filter((s) => s && s.trim().length > 0)
     .join("\n\n");
 
-  const messages: Message[] = [{ role: "user", content: input.prompt, timestamp: Date.now() }];
+  const messages: Message[] = [
+    { role: "user", content: buildUserContent(input), timestamp: Date.now() },
+  ];
 
-  const model = getModel(def.model.provider as never, def.model.model as never) as Parameters<
-    typeof complete
-  >[0];
-  const resolvedModel = { provider: def.model.provider, model: def.model.model };
-  const baseOptions: ProviderStreamOptions = {
-    apiKey,
-    signal,
-    maxTokens: input.maxTokens ?? 1024,
-    ...(input.temperature != null ? { temperature: input.temperature } : {}),
-  };
+  /**
+   * Try each candidate in order. On upstream/network error, advance to the
+   * next candidate; on success, return the message + the resolved model.
+   * Throws the last error if every candidate fails — caller catches and maps
+   * to DroneError.
+   */
+  let lockedCandidate: Candidate | null = null;
+  async function attemptComplete(extraOptions: Partial<ProviderStreamOptions> = {}): Promise<{
+    msg: Awaited<ReturnType<typeof complete>>;
+    resolvedModel: { provider: string; model: string };
+  }> {
+    // Once a candidate has answered for this run, stick with it for later
+    // turns (tool-loop continuations) — switching mid-conversation would
+    // break tool-call/result pairing.
+    const pool = lockedCandidate ? [lockedCandidate] : candidates;
+    let lastError: unknown;
+    for (const cand of pool) {
+      const m = getModel(cand.spec.provider as never, cand.spec.model as never) as Parameters<
+        typeof complete
+      >[0];
+      try {
+        const opts: ProviderStreamOptions = {
+          apiKey: cand.apiKey,
+          signal,
+          maxTokens: input.maxTokens ?? 1024,
+          ...(input.temperature != null ? { temperature: input.temperature } : {}),
+          ...extraOptions,
+        };
+        const msg = await complete(
+          m,
+          { systemPrompt, messages, tools: extraOptions.tools as never },
+          opts,
+        );
+        lockedCandidate = cand;
+        return { msg, resolvedModel: cand.spec };
+      } catch (e) {
+        lastError = e;
+        if (signal.aborted) {
+          throw e;
+        }
+        // continue to next candidate
+      }
+    }
+    throw lastError ?? new Error("all candidates failed");
+  }
 
   // Mode dispatch
   try {
     if (def.output) {
       // Schema-only mode
       const schema = def.output as TObject;
-      const ctx: Context = {
-        systemPrompt,
-        messages,
+      const { msg, resolvedModel } = await attemptComplete({
+        toolChoice: { type: "tool", name: SCHEMA_TOOL_NAME },
+        maxTokens: input.maxTokens ?? 512,
         tools: [
           {
             name: SCHEMA_TOOL_NAME,
             description: "Return a structured result.",
             parameters: schema,
           },
-        ],
-      };
-      const msg = await complete(model, ctx, {
-        ...baseOptions,
-        toolChoice: { type: "tool", name: SCHEMA_TOOL_NAME },
-        maxTokens: input.maxTokens ?? 512,
+        ] as unknown as ProviderStreamOptions["tools"],
       });
       usage = mergeUsage(usage, msg);
       const calls = findToolCalls(msg);
@@ -204,14 +282,16 @@ export async function runDrone<TOut>(
       parameters: t.parameters,
     }));
     const toolMap = new Map(tools.map((t) => [t.name, t]));
+    let lastResolvedModel: { provider: string; model: string } = {
+      provider: def.model.provider,
+      model: def.model.model,
+    };
 
     for (let step = 0; step < maxSteps; step++) {
-      const ctx: Context = {
-        systemPrompt,
-        messages,
-        tools: piTools.length > 0 ? piTools : undefined,
-      };
-      const msg = await complete(model, ctx, baseOptions);
+      const { msg, resolvedModel: rm } = await attemptComplete({
+        tools: piTools.length > 0 ? (piTools as never) : undefined,
+      });
+      lastResolvedModel = rm;
       usage = mergeUsage(usage, msg);
       messages.push(msg);
 
@@ -223,7 +303,7 @@ export async function runDrone<TOut>(
           data: findText(msg) as TOut,
           usage,
           durationMs: Date.now() - started,
-          resolvedModel,
+          resolvedModel: lastResolvedModel,
         });
       }
 
