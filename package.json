@@ -4,17 +4,23 @@
   "description": "Middle-tier mini-agent primitive: isolated LLM call with own model, system prompt, tools, and skills. Sits between forcedToolCall and runEmbeddedPiAgent.",
   "license": "MIT",
   "files": [
-    "src",
+    "dist",
     "README.md"
   ],
   "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "exports": {
-    ".": "./src/index.ts"
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
   },
   "publishConfig": {
     "access": "public"
   },
   "scripts": {
+    "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "typecheck": "tsc --noEmit"
   },
