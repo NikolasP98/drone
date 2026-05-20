@@ -1,6 +1,6 @@
 {
   "name": "@nikolasp98/drone",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Middle-tier mini-agent primitive: isolated LLM call with own model, system prompt, tools, and skills. Sits between forcedToolCall and runEmbeddedPiAgent.",
   "license": "MIT",
   "files": [
@@ -20,17 +20,21 @@
     "access": "public"
   },
   "scripts": {
+    "baml:generate": "baml-cli generate --from baml_src",
     "build": "tsc -p tsconfig.build.json",
     "test": "vitest run",
+    "test:live": "vitest run --config vitest.live.config.ts",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
+    "@boundaryml/baml": "^0.84.0",
     "@mariozechner/pi-ai": "0.53.0",
     "@sinclair/typebox": "0.34.48",
     "typescript": "^5.5.0",
     "vitest": "^3.2.4"
   },
   "peerDependencies": {
+    "@boundaryml/baml": "*",
     "@mariozechner/pi-ai": "*",
     "@sinclair/typebox": "*"
   }
