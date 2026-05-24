@@ -22,6 +22,7 @@
   "scripts": {
     "baml:generate": "baml-cli generate --from baml_src",
     "build": "tsc -p tsconfig.build.json",
+    "prepack": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
     "typecheck": "tsc --noEmit"
