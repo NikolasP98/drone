@@ -28,7 +28,7 @@
   },
   "devDependencies": {
     "@boundaryml/baml": "^0.84.0",
-    "@mariozechner/pi-ai": "0.53.0",
+    "@mariozechner/pi-ai": "0.73.1",
     "@sinclair/typebox": "0.34.48",
     "typescript": "^5.5.0",
     "vitest": "^3.2.4"
