@@ -1,5 +1,5 @@
-import { getModel, stream } from "@mariozechner/pi-ai";
-import type { Context, Message, ProviderStreamOptions } from "@mariozechner/pi-ai";
+import { getModel, stream } from "@earendil-works/pi-ai";
+import type { Context, Message, ProviderStreamOptions } from "@earendil-works/pi-ai";
 import type {
   Drone,
   DroneError,

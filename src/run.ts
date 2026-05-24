@@ -1,4 +1,4 @@
-import { complete, getModel } from "@mariozechner/pi-ai";
+import { complete, getModel } from "@earendil-works/pi-ai";
 import type {
   AssistantMessage,
   Context,
@@ -6,7 +6,7 @@ import type {
   ProviderStreamOptions,
   ToolCall,
   ToolResultMessage,
-} from "@mariozechner/pi-ai";
+} from "@earendil-works/pi-ai";
 import type { TObject } from "@sinclair/typebox";
 import { Value } from "@sinclair/typebox/value";
 import { forceToolCallShape } from "./provider-shapes.js";

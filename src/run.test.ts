@@ -1,11 +1,11 @@
-import type { AssistantMessage } from "@mariozechner/pi-ai";
+import type { AssistantMessage } from "@earendil-works/pi-ai";
 import { Type } from "@sinclair/typebox";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
 const completeMock = vi.fn();
 const getModelMock = vi.fn(() => ({ provider: "anthropic", id: "claude-haiku-4-5" }));
 
-vi.mock("@mariozechner/pi-ai", () => ({
+vi.mock("@earendil-works/pi-ai", () => ({
   complete: completeMock,
   getModel: getModelMock,
 }));
