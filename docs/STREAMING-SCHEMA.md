@@ -96,7 +96,7 @@ export const EntityExtractionSchema = Type.Object({
 ```ts
 import { ClientRegistry } from "@boundaryml/baml";
 import { b } from "./baml_client/index.js";
-import { defineStreamingDrone, runStreamingSchemaDrone } from "@nikolasp98/drone";
+import { defineStreamingDrone, runStreamingSchemaDrone } from "@minion-stack/drone";
 
 export const extractEntities = defineStreamingDrone({
   id: "extract-entities",

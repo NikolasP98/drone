@@ -1,4 +1,4 @@
-# @nikolasp98/drone
+# @minion-stack/drone
 
 > Middle-tier mini-agent primitive: an isolated LLM call with its own model,
 > system prompt, tools, and skills. Sits between a one-shot forced tool call and
@@ -10,7 +10,7 @@ a host that supplies the provider transport. Drones can stream, enforce typed
 output via BAML streaming-schema mode, and fall back across providers.
 
 ```ts
-import { defineDrone, runDrone } from "@nikolasp98/drone";
+import { defineDrone, runDrone } from "@minion-stack/drone";
 
 const summarizer = defineDrone({
   model: { provider: "openrouter", model: "google/gemini-2.5-flash" },
@@ -54,7 +54,7 @@ pnpm test:live                    # live provider smoke tests (needs API keys)
 Publishing is automated via `.github/workflows/publish.yml`: push a `v*` tag (or
 run the workflow manually) and CI runs baml generate → build → `pnpm publish`.
 Bump `version` in `package.json` first. Requires the `NPM_TOKEN` repo secret to
-have publish rights to the `@nikolasp98` scope.
+have publish rights to the `@minion-stack` scope.
 
 ## License
 

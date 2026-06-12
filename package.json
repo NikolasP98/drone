@@ -1,6 +1,10 @@
 {
-  "name": "@nikolasp98/drone",
+  "name": "@minion-stack/drone",
   "version": "0.2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/NikolasP98/drone.git"
+  },
   "description": "Middle-tier mini-agent primitive: isolated LLM call with own model, system prompt, tools, and skills. Sits between forcedToolCall and runEmbeddedPiAgent.",
   "license": "MIT",
   "files": [
