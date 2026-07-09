@@ -335,13 +335,24 @@ export async function runDrone<TOut>(
       }
 
       for (const call of calls) {
+        const emitTool = (phase: "start" | "end", isError?: boolean) =>
+          host.emitEvent?.({
+            event: "agent.run.tool",
+            droneId: def.id,
+            correlationId,
+            toolName: call.name,
+            toolPhase: phase,
+            toolIsError: isError,
+          });
         const tool = toolMap.get(call.name);
         if (!tool) {
           messages.push(toolResult(call, `Unknown tool "${call.name}"`, true));
           continue;
         }
+        emitTool("start");
         try {
           if (!Value.Check(tool.parameters, call.arguments)) {
+            emitTool("end", true);
             messages.push(toolResult(call, `Invalid arguments for "${call.name}"`, true));
             continue;
           }
@@ -350,10 +361,12 @@ export async function runDrone<TOut>(
             correlationId,
             abortSignal: signal,
           });
+          emitTool("end", false);
           messages.push(
             toolResult(call, typeof out === "string" ? out : JSON.stringify(out), false),
           );
         } catch (e) {
+          emitTool("end", true);
           return finish({
             ok: false,
             error: err("TOOL_FAILED", `tool "${call.name}" threw: ${String(e)}`, e),

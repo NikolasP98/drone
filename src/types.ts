@@ -158,6 +158,8 @@ export type DroneHost = {
 /** Streaming events emitted by `runDroneStream`. */
 export type DroneStreamEvent =
   | { type: "text"; delta: string }
+  | { type: "thinking"; delta: string }
+  | { type: "tool"; phase: "start" | "end"; name: string; toolCallId: string; isError?: boolean }
   | {
       type: "done";
       data: string;
@@ -168,12 +170,16 @@ export type DroneStreamEvent =
   | { type: "error"; error: DroneError; durationMs: number };
 
 export type DroneEventInput = {
-  event: "agent.run.start" | "agent.run.end" | "agent.run.error";
+  event: "agent.run.start" | "agent.run.end" | "agent.run.error" | "agent.run.tool";
   droneId: string;
   correlationId?: string;
   durationMs?: number;
   usage?: DroneUsage;
   errorCode?: DroneErrorCode;
+  /** agent.run.tool only: which tool, and where in its lifecycle. */
+  toolName?: string;
+  toolPhase?: "start" | "end";
+  toolIsError?: boolean;
 };
 
 /** Opaque handle returned by defineDrone — keeps definition immutable. */
