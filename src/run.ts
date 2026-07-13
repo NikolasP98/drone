@@ -73,6 +73,17 @@ function findText(msg: AssistantMessage): string {
     .join("");
 }
 
+function sanitizeUpstreamError(message: string | undefined): string {
+  const normalized = message
+    ?.replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!normalized) {
+    return "provider returned no error details";
+  }
+  return normalized.slice(0, 1_000);
+}
+
 /**
  * Build the user-message content for a drone call. Returns a plain string
  * when no images are attached (most cases), or the mixed array form when
@@ -227,6 +238,15 @@ export async function runDrone<TOut>(
           { systemPrompt, messages, tools: rawExtra.tools as never },
           opts,
         );
+        // pi-ai represents provider failures as resolved AssistantMessages
+        // instead of rejected promises. Treat those terminal messages like
+        // thrown transport errors so an unlocked run can try its fallback
+        // candidates and the final DroneError keeps the upstream diagnostic.
+        if (msg.stopReason === "error" || msg.stopReason === "aborted") {
+          throw new Error(
+            `${cand.spec.provider}/${cand.spec.model} returned ${msg.stopReason}: ${sanitizeUpstreamError(msg.errorMessage)}`,
+          );
+        }
         lockedCandidate = cand;
         return { msg, resolvedModel: cand.spec };
       } catch (e) {

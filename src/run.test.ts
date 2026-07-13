@@ -52,6 +52,29 @@ function asstWithText(text: string): AssistantMessage {
   } as unknown as AssistantMessage;
 }
 
+function asstWithUpstreamFailure(
+  stopReason: "error" | "aborted",
+  errorMessage: string,
+): AssistantMessage {
+  return {
+    role: "assistant",
+    content: [],
+    api: "anthropic-messages",
+    provider: "anthropic",
+    model: "claude-haiku-4-5",
+    usage: {
+      input: 0,
+      output: 0,
+      cacheRead: 0,
+      cacheWrite: 0,
+      totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    },
+    stopReason,
+    errorMessage,
+  } as unknown as AssistantMessage;
+}
+
 function mockHost(events: DroneEventInput[] = []): DroneHost {
   return {
     resolveApiKey: async () => ({ apiKey: "test-key", source: "test" }),
@@ -105,6 +128,62 @@ describe("runDrone — schema-only mode", () => {
     expect(r.ok).toBe(false);
     if (!r.ok) {
       expect(r.error.code).toBe("SCHEMA_INVALID");
+    }
+  });
+
+  it.each(["error", "aborted"] as const)(
+    "falls back when the primary resolves with stopReason=%s",
+    async (stopReason) => {
+      const Schema = Type.Object({ verdict: Type.String() });
+      const drone = defineDrone({
+        ...baseDef,
+        model: {
+          ...baseDef.model,
+          fallbacks: [{ provider: "openai", model: "gpt-5.4" }],
+        },
+        output: Schema,
+      });
+      completeMock
+        .mockResolvedValueOnce(asstWithUpstreamFailure(stopReason, " upstream\n failure "))
+        .mockResolvedValueOnce(asstWithToolCall("result", { verdict: "yes" }));
+
+      const r = await runDrone(drone, { prompt: "hi" }, mockHost());
+
+      expect(completeMock).toHaveBeenCalledTimes(2);
+      expect(r.ok).toBe(true);
+      if (r.ok) {
+        expect(r.data).toEqual({ verdict: "yes" });
+        expect(r.resolvedModel).toEqual({ provider: "openai", model: "gpt-5.4" });
+      }
+    },
+  );
+
+  it("returns UPSTREAM_ERROR when every candidate resolves with an error", async () => {
+    const Schema = Type.Object({ verdict: Type.String() });
+    const drone = defineDrone({
+      ...baseDef,
+      model: {
+        ...baseDef.model,
+        fallbacks: [{ provider: "openai", model: "gpt-5.4" }],
+      },
+      output: Schema,
+    });
+    completeMock
+      .mockResolvedValueOnce(asstWithUpstreamFailure("error", "primary failed"))
+      .mockResolvedValueOnce(
+        asstWithUpstreamFailure("error", " fallback\n failed\u0000with details "),
+      );
+
+    const r = await runDrone(drone, { prompt: "hi" }, mockHost());
+
+    expect(completeMock).toHaveBeenCalledTimes(2);
+    expect(r.ok).toBe(false);
+    if (!r.ok) {
+      expect(r.error.code).toBe("UPSTREAM_ERROR");
+      expect(r.error.code).not.toBe("NO_TOOL_CALL");
+      expect(r.error.message).toContain(
+        "openai/gpt-5.4 returned error: fallback failed with details",
+      );
     }
   });
 
