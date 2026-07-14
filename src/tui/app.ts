@@ -25,6 +25,10 @@ import {
   type WorkspaceApprovalRequest,
 } from "../runtime/workspace.js";
 import type { Drone, DroneStreamEvent } from "../types.js";
+import {
+  approvalDecisionForKey,
+  formatApprovalPreview,
+} from "./approval.js";
 import { renderDroneArt } from "./art.js";
 import {
   acceptCompletion,
@@ -63,6 +67,7 @@ export type DroneTuiOptions = {
 type ApprovalDecision = {
   request: WorkspaceApprovalRequest;
   resolve: (approved: boolean) => void;
+  timeout?: NodeJS.Timeout;
 };
 
 type MessageView = {
@@ -89,6 +94,25 @@ const HELP = [
   "",
   "Mouse: scroll the transcript, select to copy, or click footer actions.",
 ].join("\n");
+
+const TUI_TERMINATION_EXIT_CODES: Readonly<Record<string, number>> = {
+  SIGINT: 130,
+  SIGHUP: 129,
+  SIGTERM: 143,
+};
+
+/** Signals a failure after the full-screen session began, so the CLI must not replay its prompt. */
+export class DroneTuiSessionError extends Error {
+  readonly exitCode: number;
+  readonly signal?: NodeJS.Signals;
+
+  constructor(message: string, options: { cause?: unknown; signal?: NodeJS.Signals } = {}) {
+    super(message, options.cause === undefined ? undefined : { cause: options.cause });
+    this.name = "DroneTuiSessionError";
+    this.signal = options.signal;
+    this.exitCode = options.signal ? (TUI_TERMINATION_EXIT_CODES[options.signal] ?? 1) : 1;
+  }
+}
 
 function formatDuration(ms: number | undefined): string {
   if (ms == null) return "—";
@@ -123,7 +147,12 @@ function addText(
   parent: BoxRenderable,
   id: string,
   content: string,
-  options: { fg: string; width?: number | `${number}%`; flexGrow?: number; wrapMode?: "none" | "word" } ,
+  options: {
+    fg: string;
+    width?: number | `${number}%`;
+    flexGrow?: number;
+    wrapMode?: "none" | "word";
+  },
 ): TextRenderable {
   const text = new TextRenderable(ctx, {
     id,
@@ -163,33 +192,60 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     exitOnCtrlC: false,
     openConsoleOnError: false,
   });
-  renderer.setTerminalTitle(`drone · ${basename(options.cwd) || options.cwd}`);
+  let rendererStarted = false;
+  let shutdownRequested = false;
+  let rendererStoppedUnexpectedly = false;
+  let terminationSignal: NodeJS.Signals | undefined;
+  let syntaxStyle: SyntaxStyle | undefined;
+  let lifecycleCleanup: (() => void) | undefined;
+  const terminationHandlers = new Map<NodeJS.Signals, () => void>();
+  for (const signal of ["SIGINT", "SIGHUP", "SIGTERM"] as const) {
+    const handler = (): void => {
+      terminationSignal = signal;
+      if (!renderer.isDestroyed) renderer.destroy();
+    };
+    terminationHandlers.set(signal, handler);
+    process.on(signal, handler);
+  }
 
-  const terminalTheme = await renderer.waitForThemeMode(120).catch(() => null);
-  let palette = resolvePalette(
-    config.ui.theme,
-    terminalTheme,
-    process.env.NO_COLOR != null || process.env.DRONE_NO_COLOR === "1",
-  );
-  renderer.setBackgroundColor(palette.background);
+  try {
+    renderer.setTerminalTitle(`drone · ${basename(options.cwd) || options.cwd}`);
 
-  const syntaxStyle = SyntaxStyle.fromStyles({
-    default: { fg: palette.text },
-    "markup.heading": { fg: palette.accent, bold: true },
-    "markup.bold": { fg: palette.text, bold: true },
-    "markup.italic": { fg: palette.text, italic: true },
-    "markup.link": { fg: palette.user, underline: true },
-    "markup.raw": { fg: palette.success },
-    comment: { fg: palette.muted, italic: true },
-    keyword: { fg: palette.accent },
-    string: { fg: palette.success },
-  });
+    const terminalTheme = await renderer.waitForThemeMode(120).catch(() => null);
+    if (terminationSignal) {
+      throw new DroneTuiSessionError(`Drone TUI terminated by ${terminationSignal}.`, {
+        signal: terminationSignal,
+      });
+    }
+    if (renderer.isDestroyed) {
+      throw new Error("Drone renderer stopped during startup");
+    }
+    let palette = resolvePalette(
+      config.ui.theme,
+      terminalTheme,
+      process.env.NO_COLOR != null || process.env.DRONE_NO_COLOR === "1",
+    );
+    renderer.setBackgroundColor(palette.background);
+
+    const activeSyntaxStyle = SyntaxStyle.fromStyles({
+      default: { fg: palette.text },
+      "markup.heading": { fg: palette.accent, bold: true },
+      "markup.bold": { fg: palette.text, bold: true },
+      "markup.italic": { fg: palette.text, italic: true },
+      "markup.link": { fg: palette.user, underline: true },
+      "markup.raw": { fg: palette.success },
+      comment: { fg: palette.muted, italic: true },
+      keyword: { fg: palette.accent },
+      string: { fg: palette.success },
+    });
+    syntaxStyle = activeSyntaxStyle;
 
   let state = createInitialTuiState();
   let frame = 0;
   let frameElapsed = 0;
   let animationLive = false;
   let activeAbort: AbortController | undefined;
+  let activeDeadlineAt: number | undefined;
   let pendingApproval: ApprovalDecision | undefined;
   let panel: "help" | "config" | undefined;
   let finished = false;
@@ -467,12 +523,24 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     backgroundColor: palette.surfaceRaised,
   });
   root.add(approvalModal);
-  const approvalTitle = addText(renderer, approvalModal, "approval-title", "APPROVAL REQUIRED", {
-    fg: palette.warning,
-  });
-  const approvalBody = addText(renderer, approvalModal, "approval-body", "", {
-    fg: palette.text,
+  const approvalTitle = addText(
+    renderer,
+    approvalModal,
+    "approval-title",
+    "APPROVAL REQUIRED · ↑/↓ REVIEW",
+    { fg: palette.warning },
+  );
+  const approvalBodyViewport = new ScrollBoxRenderable(renderer, {
+    id: "approval-body-viewport",
+    width: "100%",
     flexGrow: 1,
+    scrollY: true,
+    viewportCulling: true,
+    backgroundColor: palette.surfaceRaised,
+  });
+  approvalModal.add(approvalBodyViewport);
+  const approvalBody = addText(renderer, approvalBodyViewport, "approval-body", "", {
+    fg: palette.text,
   });
   const approvalActions = new BoxRenderable(renderer, {
     id: "approval-actions",
@@ -500,7 +568,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     approvalActions.add(control);
   }
   approvalButton("Allow once [Y]", true);
-  approvalButton("Deny [N/Esc]", false);
+  approvalButton("Deny [N/Esc/Enter]", false);
 
   const messageViews = new Map<string, MessageView>();
 
@@ -531,7 +599,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     const body = new MarkdownRenderable(renderer, {
       id: `message-${entry.id}-body`,
       content: entry.content || " ",
-      syntaxStyle,
+      syntaxStyle: activeSyntaxStyle,
       fg: tone,
       width: "100%",
       height: "auto",
@@ -953,29 +1021,36 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     syncView();
   }
 
-  function decideApproval(approved: boolean): void {
+  function decideApproval(approved: boolean, render = true): void {
     const decision = pendingApproval;
     if (!decision) return;
     pendingApproval = undefined;
+    if (decision.timeout) clearTimeout(decision.timeout);
     state = { ...state, status: "tool" };
     decision.resolve(approved);
-    syncView();
+    if (render && !renderer.isDestroyed) syncView();
   }
 
   async function approve(request: WorkspaceApprovalRequest): Promise<boolean> {
     if (!config.runtime.requireApproval) return true;
+    const preview = formatApprovalPreview(request);
+    if (!preview.approvable) {
+      addSystemMessage(preview.reason ?? "Operation denied because it cannot be previewed safely.");
+      return false;
+    }
+    const remainingMs =
+      activeDeadlineAt == null ? undefined : Math.max(0, activeDeadlineAt - Date.now());
+    if (remainingMs === 0) return false;
     return await new Promise<boolean>((resolve) => {
-      pendingApproval = { request, resolve };
+      const decision: ApprovalDecision = { request, resolve };
+      pendingApproval = decision;
+      if (remainingMs != null) {
+        decision.timeout = setTimeout(() => decideApproval(false), remainingMs);
+      }
       completion = undefined;
       renderCompletionMenu();
       state = { ...state, status: "approval" };
-      approvalBody.content = [
-        request.kind === "run_command" ? "Drone wants to run a shell command:" : "Drone wants to write a file:",
-        "",
-        request.command ?? request.path ?? request.summary,
-        "",
-        `workspace: ${request.cwd}`,
-      ].join("\n");
+      approvalBody.content = preview.body;
       syncView();
     });
   }
@@ -1099,6 +1174,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     const turnId = randomUUID();
     state = addUserTurn(state, value, turnId);
     activeAbort = new AbortController();
+    activeDeadlineAt = Date.now() + config.timeoutMs;
     syncView();
 
     try {
@@ -1117,11 +1193,15 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
         syncView();
       }
     } finally {
+      decideApproval(false, false);
       activeAbort = undefined;
+      activeDeadlineAt = undefined;
       if (state.status !== "error") state = { ...state, status: "idle" };
-      syncView();
-      composer.focus();
-      void refreshWorkspaceSources();
+      if (!finished && !renderer.isDestroyed) {
+        syncView();
+        composer.focus();
+        void refreshWorkspaceSources();
+      }
     }
   }
 
@@ -1146,8 +1226,8 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     }
   }
 
-  function cancelFlight(): void {
-    decideApproval(false);
+  function cancelFlight(render = true): void {
+    decideApproval(false, render);
     activeAbort?.abort(new Error("Cancelled by user"));
   }
 
@@ -1159,6 +1239,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
   function finish(): void {
     if (finished) return;
     finished = true;
+    shutdownRequested = true;
     cancelFlight();
     if (animationLive) {
       animationLive = false;
@@ -1168,10 +1249,23 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     exitResolve?.();
   }
 
+  function handleRendererDestroy(): void {
+    if (shutdownRequested) return;
+    rendererStoppedUnexpectedly = true;
+    finished = true;
+    cancelFlight(false);
+    exitResolve?.();
+  }
+
   function handleGlobalKey(key: KeyEvent): void {
     if (pendingApproval) {
-      if (key.name === "y" || key.name === "enter") decideApproval(true);
-      else if (key.name === "n" || key.name === "escape") decideApproval(false);
+      const decision = approvalDecisionForKey(key.name);
+      if (decision === "approve") decideApproval(true);
+      else if (decision === "deny") decideApproval(false);
+      else if (key.name === "up") approvalBodyViewport.scrollBy(-1);
+      else if (key.name === "down") approvalBodyViewport.scrollBy(1);
+      else if (key.name === "pageup") approvalBodyViewport.scrollBy(-6);
+      else if (key.name === "pagedown") approvalBodyViewport.scrollBy(6);
       key.preventDefault();
       key.stopPropagation();
       return;
@@ -1260,6 +1354,18 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     return false;
   }
 
+  lifecycleCleanup = () => {
+    decideApproval(false, false);
+    activeAbort?.abort(new Error("Drone TUI stopped"));
+    renderer.off(CliRenderEvents.DESTROY, handleRendererDestroy);
+    renderer.keyInput.off("keypress", handleGlobalKey);
+    renderer.removeInputHandler(handleRawInput);
+    syntaxStyle?.destroy();
+    syntaxStyle = undefined;
+    if (!renderer.isDestroyed) renderer.destroy();
+  };
+
+  renderer.on(CliRenderEvents.DESTROY, handleRendererDestroy);
   renderer.prependInputHandler(handleRawInput);
   renderer.keyInput.on("keypress", handleGlobalKey);
   renderer.on(CliRenderEvents.RESIZE, () => {
@@ -1290,17 +1396,42 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
   void refreshWorkspaceSources(sourceDiscovery);
   syncView();
   composer.focus();
+  rendererStarted = true;
   renderer.start();
   if (options.initialPrompt?.trim()) void submit(options.initialPrompt.trim());
 
-  try {
-    await exited;
+  await exited;
+  if (terminationSignal) {
+    throw new DroneTuiSessionError(`Drone TUI terminated by ${terminationSignal}.`, {
+      signal: terminationSignal,
+    });
+  }
+  if (rendererStoppedUnexpectedly) {
+    throw new DroneTuiSessionError("Drone renderer stopped unexpectedly.");
+  }
+  } catch (error) {
+    if (error instanceof DroneTuiSessionError) throw error;
+    if (terminationSignal) {
+      throw new DroneTuiSessionError(`Drone TUI terminated by ${terminationSignal}.`, {
+        cause: error,
+        signal: terminationSignal,
+      });
+    }
+    if (rendererStarted) {
+      throw new DroneTuiSessionError(
+        `Drone TUI failed after startup: ${error instanceof Error ? error.message : String(error)}`,
+        { cause: error },
+      );
+    }
+    throw error;
   } finally {
-    activeAbort?.abort();
-    pendingApproval?.resolve(false);
-    renderer.keyInput.off("keypress", handleGlobalKey);
-    renderer.removeInputHandler(handleRawInput);
-    syntaxStyle.destroy();
-    if (!renderer.isDestroyed) renderer.destroy();
+    for (const [signal, handler] of terminationHandlers) {
+      process.off(signal, handler);
+    }
+    if (lifecycleCleanup) lifecycleCleanup();
+    else {
+      syntaxStyle?.destroy();
+      if (!renderer.isDestroyed) renderer.destroy();
+    }
   }
 }

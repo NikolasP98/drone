@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -6,7 +7,9 @@ import {
   readFile,
   readdir,
   realpath,
+  rename,
   stat,
+  unlink,
 } from "node:fs/promises";
 import { constants, realpathSync } from "node:fs";
 import path from "node:path";
@@ -28,6 +31,27 @@ const DEFAULT_MAX_SEARCH_RESULTS = 200;
 
 const SENSITIVE_ENV_NAME =
   /(?:^|_)(?:API_?KEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|AUTH(?:ORIZATION)?|PAT)(?:$|_)/i;
+
+const SAFE_ENV_TEMPLATES = new Set([".env.example", ".env.sample", ".env.template"]);
+const SENSITIVE_CREDENTIAL_FILES = new Set([
+  ".envrc",
+  ".git-credentials",
+  ".netrc",
+  ".npmrc",
+  ".pypirc",
+  "application_default_credentials.json",
+  "auth.json",
+  "credentials",
+  "credentials.json",
+  "id_dsa",
+  "id_ecdsa",
+  "id_ed25519",
+  "id_rsa",
+  "secrets.json",
+  "service-account.json",
+  "service_account.json",
+]);
+const SENSITIVE_CREDENTIAL_EXTENSIONS = new Set([".key", ".p12", ".pem", ".pfx"]);
 
 const PROVIDER_API_KEYS: Readonly<Record<string, readonly string[]>> = {
   anthropic: ["ANTHROPIC_API_KEY"],
@@ -201,6 +225,32 @@ function isMissingPathError(error: unknown): boolean {
   );
 }
 
+function portablePath(input: string): string {
+  return input.split(path.sep).join("/");
+}
+
+/** Keep credential material out of model-visible read and search results. */
+function isSensitiveWorkspacePath(input: string): boolean {
+  const normalized = portablePath(input).toLowerCase();
+  const basename = path.posix.basename(normalized);
+  if (SAFE_ENV_TEMPLATES.has(basename)) {
+    return false;
+  }
+  if (basename === ".env" || basename.startsWith(".env.")) {
+    return true;
+  }
+  if (SENSITIVE_CREDENTIAL_FILES.has(basename)) {
+    return true;
+  }
+  return SENSITIVE_CREDENTIAL_EXTENSIONS.has(path.posix.extname(basename));
+}
+
+function assertReadableWorkspacePath(relative: string, operation: string): void {
+  if (isSensitiveWorkspacePath(relative)) {
+    throw new Error(`${operation} refuses sensitive credential path: ${relative}`);
+  }
+}
+
 function requiredString(args: unknown, key: string): string {
   if (typeof args !== "object" || args === null) {
     throw new Error(`expected an object with string property "${key}"`);
@@ -263,10 +313,51 @@ function optionalStringArray(args: unknown, key: string): string[] {
 async function ensureApproval(
   approve: WorkspaceApprovalCallback | undefined,
   request: WorkspaceApprovalRequest,
+  abortSignal: AbortSignal | undefined,
 ): Promise<void> {
-  if (!approve || !(await approve(request))) {
+  throwIfAborted(abortSignal, request.kind);
+  if (!approve) {
     throw new Error(`${request.kind} was not approved`);
   }
+  const approval = Promise.resolve(approve(request));
+  const approved = await waitForApprovalOrAbort(approval, abortSignal, request.kind);
+  throwIfAborted(abortSignal, request.kind);
+  if (!approved) throw new Error(`${request.kind} was not approved`);
+}
+
+function abortedOperationError(operation: string): Error {
+  const error = new Error(`${operation} was aborted`);
+  error.name = "AbortError";
+  return error;
+}
+
+function throwIfAborted(abortSignal: AbortSignal | undefined, operation: string): void {
+  if (abortSignal?.aborted) throw abortedOperationError(operation);
+}
+
+async function waitForApprovalOrAbort<T>(
+  approval: Promise<T>,
+  abortSignal: AbortSignal | undefined,
+  operation: string,
+): Promise<T> {
+  if (!abortSignal) return await approval;
+  throwIfAborted(abortSignal, operation);
+
+  return await new Promise<T>((resolve, reject) => {
+    const onAbort = (): void => reject(abortedOperationError(operation));
+    const cleanup = (): void => abortSignal.removeEventListener("abort", onAbort);
+    abortSignal.addEventListener("abort", onAbort, { once: true });
+    approval.then(
+      (value) => {
+        cleanup();
+        resolve(value);
+      },
+      (error: unknown) => {
+        cleanup();
+        reject(error);
+      },
+    );
+  });
 }
 
 export function sanitizeEnvironment(
@@ -489,6 +580,9 @@ async function fallbackSearch(options: {
       continue;
     }
     const relative = options.workspace.relative(current);
+    if (isSensitiveWorkspacePath(relative)) {
+      continue;
+    }
     if (options.globs.length > 0 && !options.globs.some((glob) => simpleGlobMatch(relative, glob))) {
       continue;
     }
@@ -524,8 +618,12 @@ function parseRipgrepOutput(
       continue;
     }
     const [, file = "", line = "0", text = ""] = match;
+    const relative = workspace.relative(path.resolve(workspace.root, file));
+    if (isSensitiveWorkspacePath(relative)) {
+      continue;
+    }
     matches.push({
-      path: workspace.relative(path.resolve(workspace.root, file)),
+      path: relative,
       line: Number.parseInt(line, 10),
       text,
     });
@@ -550,6 +648,7 @@ async function writeAnchoredFile(
   workspace: ConfinedWorkspace,
   absolute: string,
   content: string,
+  abortSignal?: AbortSignal,
 ): Promise<void> {
   if (process.platform !== "linux") {
     throw new Error(
@@ -587,20 +686,54 @@ async function writeAnchoredFile(
       }
     }
 
-    const file = await open(
-      path.join(`/proc/self/fd/${directory.fd}`, path.basename(absolute)),
-      constants.O_WRONLY | constants.O_CREAT | constants.O_NOFOLLOW,
-      0o666,
-    );
+    const anchoredParent = `/proc/self/fd/${directory.fd}`;
+    const finalPath = path.join(anchoredParent, path.basename(absolute));
+    let existingMode: number | undefined;
     try {
+      const existing = await lstat(finalPath);
+      if (existing.isSymbolicLink()) {
+        throw new Error("workspace write target is a symbolic link");
+      }
+      if (!existing.isFile()) {
+        throw new Error("workspace write target is not a regular file");
+      }
+      existingMode = existing.mode & 0o777;
+    } catch (error) {
+      if (!isMissingPathError(error)) throw error;
+    }
+
+    const temporaryPath = path.join(
+      anchoredParent,
+      `.drone-write-${process.pid}-${randomUUID()}.tmp`,
+    );
+    let temporaryExists = false;
+    try {
+      throwIfAborted(abortSignal, "write_file");
+      const file = await open(
+        temporaryPath,
+        constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+        existingMode ?? 0o666,
+      );
+      temporaryExists = true;
+      try {
+        if (existingMode !== undefined) await file.chmod(existingMode);
+        await file.writeFile(content, "utf8");
+        await file.sync();
+      } finally {
+        await file.close();
+      }
+
       const openedDirectory = await realpath(`/proc/self/fd/${directory.fd}`);
       if (!isWithin(workspace.root, openedDirectory)) {
         throw new Error("workspace write parent moved outside cwd");
       }
-      await file.truncate(0);
-      await file.writeFile(content, "utf8");
+      throwIfAborted(abortSignal, "write_file");
+      await rename(temporaryPath, finalPath);
+      temporaryExists = false;
     } finally {
-      await file.close();
+      if (temporaryExists) {
+        await unlink(temporaryPath).catch(() => undefined);
+      }
     }
   } finally {
     await directory.close();
@@ -658,6 +791,7 @@ export function createWorkspaceTools(options: WorkspaceToolsOptions): DroneToolD
     async execute(args: unknown): Promise<unknown> {
       const requested = requiredString(args, "path");
       const absolute = await workspace.resolveExisting(requested);
+      assertReadableWorkspacePath(workspace.relative(absolute), "read_file");
       const info = await stat(absolute);
       if (!info.isFile()) {
         throw new Error(`read_file path is not a file: ${requested}`);
@@ -691,6 +825,7 @@ export function createWorkspaceTools(options: WorkspaceToolsOptions): DroneToolD
       const globs = optionalStringArray(args, "globs");
       const maxResults = optionalInteger(args, "maxResults", maxSearchResults, 1, 1_000);
       const absoluteRoot = await workspace.resolveExisting(requested);
+      assertReadableWorkspacePath(workspace.relative(absoluteRoot), "search_files");
       const info = await stat(absoluteRoot);
       if (!info.isDirectory() && !info.isFile()) {
         throw new Error(`search_files path is not searchable: ${requested}`);
@@ -746,25 +881,32 @@ export function createWorkspaceTools(options: WorkspaceToolsOptions): DroneToolD
       path: Type.String({ description: "Workspace-relative file path." }),
       content: Type.String(),
     }),
-    async execute(args: unknown): Promise<unknown> {
+    async execute(args: unknown, ctx: DroneToolContext): Promise<unknown> {
+      throwIfAborted(ctx.abortSignal, "write_file");
       const requested = requiredString(args, "path");
       const content = requiredString(args, "content");
       const absolute = await workspace.resolveForWrite(requested);
       const relative = workspace.relative(absolute);
       const bytes = Buffer.byteLength(content, "utf8");
       if (options.requireApproval !== false) {
-        await ensureApproval(options.approve, {
-          kind: "write_file",
-          cwd: workspace.root,
-          path: relative,
-          bytes,
-          summary: `Write ${bytes} bytes to ${relative}`,
-        });
+        await ensureApproval(
+          options.approve,
+          {
+            kind: "write_file",
+            cwd: workspace.root,
+            path: relative,
+            bytes,
+            summary: `Write ${bytes} bytes to ${relative}`,
+          },
+          ctx.abortSignal,
+        );
       }
+      throwIfAborted(ctx.abortSignal, "write_file");
       // Re-check after approval, then anchor the final open to the verified
       // parent directory and refuse to follow a final-component symlink.
       await workspace.resolveForWrite(requested);
-      await writeAnchoredFile(workspace, absolute, content);
+      throwIfAborted(ctx.abortSignal, "write_file");
+      await writeAnchoredFile(workspace, absolute, content, ctx.abortSignal);
       return { path: relative, bytes };
     },
   };
@@ -774,18 +916,24 @@ export function createWorkspaceTools(options: WorkspaceToolsOptions): DroneToolD
     description: "Run a bash command in the workspace after explicit approval.",
     parameters: Type.Object({ command: Type.String({ minLength: 1 }) }),
     async execute(args: unknown, ctx: DroneToolContext): Promise<unknown> {
+      throwIfAborted(ctx.abortSignal, "run_command");
       const command = requiredString(args, "command");
       if (!command.trim()) {
         throw new Error("command must not be empty");
       }
       if (options.requireApproval !== false) {
-        await ensureApproval(options.approve, {
-          kind: "run_command",
-          cwd: workspace.root,
-          command,
-          summary: `Run in ${workspace.root}: ${command}`,
-        });
+        await ensureApproval(
+          options.approve,
+          {
+            kind: "run_command",
+            cwd: workspace.root,
+            command,
+            summary: `Run in ${workspace.root}: ${command}`,
+          },
+          ctx.abortSignal,
+        );
       }
+      throwIfAborted(ctx.abortSignal, "run_command");
       const result = await spawnCaptured({
         executable: "bash",
         args: ["--noprofile", "--norc", "-c", command],

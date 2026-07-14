@@ -167,13 +167,21 @@ async function main(): Promise<number> {
   }
 
   try {
-    const { runDroneTui } = await import("./tui/app.js");
-    await runDroneTui({
-      cwd,
-      config: loaded.config,
-      configDiagnostics: loaded.diagnostics.map((item) => item.message),
-      initialPrompt: prompt,
-    });
+    const { DroneTuiSessionError, runDroneTui } = await import("./tui/app.js");
+    try {
+      await runDroneTui({
+        cwd,
+        config: loaded.config,
+        configDiagnostics: loaded.diagnostics.map((item) => item.message),
+        initialPrompt: prompt,
+      });
+    } catch (error) {
+      if (error instanceof DroneTuiSessionError) {
+        process.stderr.write(`drone: ${error.message}\n`);
+        return error.exitCode;
+      }
+      throw error;
+    }
     return 0;
   } catch (error) {
     process.stderr.write(`Drone TUI could not start: ${error instanceof Error ? error.message : String(error)}\n`);

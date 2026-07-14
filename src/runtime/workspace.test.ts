@@ -1,4 +1,4 @@
-import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
+import { link, mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -27,6 +27,20 @@ function tool(tools: DroneToolDef[], name: string): DroneToolDef {
     throw new Error(`missing test tool: ${name}`);
   }
   return found;
+}
+
+function deferred<T>(): {
+  promise: Promise<T>;
+  resolve: (value: T | PromiseLike<T>) => void;
+  reject: (reason?: unknown) => void;
+} {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
 }
 
 afterEach(async () => {
@@ -88,6 +102,21 @@ describe("workspace path confinement", () => {
     );
     expect(await readFile(outsideFile, "utf8")).toBe("outside");
   });
+
+  it("atomically replaces a workspace hardlink without mutating the outside inode", async () => {
+    const cwd = await temporaryDirectory();
+    const outside = await temporaryDirectory();
+    const outsideFile = path.join(outside, "outside.txt");
+    const workspaceFile = path.join(cwd, "innocent.txt");
+    await writeFile(outsideFile, "outside", "utf8");
+    await link(outsideFile, workspaceFile);
+
+    const write = tool(createWorkspaceTools({ cwd, approve: () => true }), "write_file");
+    await write.execute({ path: "innocent.txt", content: "inside" }, context);
+
+    expect(await readFile(workspaceFile, "utf8")).toBe("inside");
+    expect(await readFile(outsideFile, "utf8")).toBe("outside");
+  });
 });
 
 describe("workspace reads and search", () => {
@@ -134,6 +163,44 @@ describe("workspace reads and search", () => {
       ]),
     );
   });
+
+  it("denies credential reads while allowing explicit environment templates", async () => {
+    const cwd = await temporaryDirectory();
+    await writeFile(path.join(cwd, ".env"), "TOKEN=hidden\n", "utf8");
+    await writeFile(path.join(cwd, "credentials.json"), '{"token":"hidden"}\n', "utf8");
+    await writeFile(path.join(cwd, ".env.example"), "TOKEN=example\n", "utf8");
+    const read = tool(createWorkspaceTools({ cwd }), "read_file");
+
+    await expect(read.execute({ path: ".env" }, context)).rejects.toThrow("sensitive credential");
+    await expect(read.execute({ path: "credentials.json" }, context)).rejects.toThrow(
+      "sensitive credential",
+    );
+    await expect(read.execute({ path: ".env.example" }, context)).resolves.toMatchObject({
+      content: "TOKEN=example\n",
+    });
+  });
+
+  it("filters sensitive credential paths from the filesystem search fallback", async () => {
+    const cwd = await temporaryDirectory();
+    await writeFile(path.join(cwd, ".env"), "needle=hidden\n", "utf8");
+    await writeFile(path.join(cwd, "credentials.json"), "needle=hidden\n", "utf8");
+    await writeFile(path.join(cwd, ".env.sample"), "needle=example\n", "utf8");
+    await writeFile(path.join(cwd, "safe.txt"), "needle=safe\n", "utf8");
+    const search = tool(
+      createWorkspaceTools({ cwd, env: { PATH: "" }, maxReadBytes: 1_024 }),
+      "search_files",
+    );
+
+    const result = (await search.execute(
+      { query: "needle", path: ".", maxResults: 10 },
+      context,
+    )) as { engine?: string; matches: Array<{ path: string }> };
+    expect(result.engine).toBe("fallback");
+    expect(result.matches.map((match) => match.path).sort()).toEqual([".env.sample", "safe.txt"]);
+    await expect(
+      search.execute({ query: "needle", path: ".env", maxResults: 10 }, context),
+    ).rejects.toThrow("sensitive credential");
+  });
 });
 
 describe("workspace mutation approval", () => {
@@ -174,6 +241,61 @@ describe("workspace mutation approval", () => {
     await write.execute({ path: "bypassed.txt", content: "ok" }, context);
     expect(approve).not.toHaveBeenCalled();
     expect(await readFile(path.join(cwd, "bypassed.txt"), "utf8")).toBe("ok");
+  });
+
+  it("does not write or spawn when approval resolves after cancellation", async () => {
+    const cwd = await temporaryDirectory();
+    const controller = new AbortController();
+    let resolveApproval: ((approved: boolean) => void) | undefined;
+    const approvalStarted = deferred<void>();
+    const approve = (): Promise<boolean> => {
+      approvalStarted.resolve(undefined);
+      return new Promise<boolean>((resolve) => {
+        resolveApproval = resolve;
+      });
+    };
+    const tools = createWorkspaceTools({ cwd, approve });
+    const write = tool(tools, "write_file");
+    const cancelledContext: DroneToolContext = {
+      droneId: "workspace-test",
+      abortSignal: controller.signal,
+    };
+
+    const pendingWrite = write.execute(
+      { path: "late.txt", content: "must-not-exist" },
+      cancelledContext,
+    );
+    await approvalStarted.promise;
+    controller.abort();
+    await expect(pendingWrite).rejects.toThrow("aborted");
+    resolveApproval?.(true);
+    await expect(readFile(path.join(cwd, "late.txt"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
+
+    const commandController = new AbortController();
+    let resolveCommandApproval: ((approved: boolean) => void) | undefined;
+    const commandApprovalStarted = deferred<void>();
+    const commandTools = createWorkspaceTools({
+      cwd,
+      approve: () => {
+        commandApprovalStarted.resolve(undefined);
+        return new Promise<boolean>((resolve) => {
+          resolveCommandApproval = resolve;
+        });
+      },
+    });
+    const pendingCommand = tool(commandTools, "run_command").execute(
+      { command: "touch spawned.txt" },
+      { droneId: "workspace-test", abortSignal: commandController.signal },
+    );
+    await commandApprovalStarted.promise;
+    commandController.abort();
+    await expect(pendingCommand).rejects.toThrow("aborted");
+    resolveCommandApproval?.(true);
+    await expect(readFile(path.join(cwd, "spawned.txt"), "utf8")).rejects.toMatchObject({
+      code: "ENOENT",
+    });
   });
 
   it("can omit write and shell tools entirely", async () => {

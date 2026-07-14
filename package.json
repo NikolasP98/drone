@@ -10,6 +10,7 @@
   "files": [
     "dist",
     "docs",
+    "LICENSE",
     "README.md"
   ],
   "bin": {
@@ -33,12 +34,15 @@
   },
   "scripts": {
     "baml:generate": "baml-cli generate --from baml_src",
-    "build": "tsc -p tsconfig.build.json",
+    "clean": "node -e \"require('node:fs').rmSync('dist', { recursive: true, force: true })\"",
+    "build": "pnpm clean && tsc -p tsconfig.build.json",
+    "build:release": "pnpm clean && pnpm baml:generate && tsc -p tsconfig.build.json",
     "dev": "bun src/cli.ts",
-    "prepack": "tsc -p tsconfig.build.json",
+    "prepack": "pnpm build:release",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "verify:package": "node scripts/verify-package.mjs"
   },
   "devDependencies": {
     "@boundaryml/baml": "^0.84.0",

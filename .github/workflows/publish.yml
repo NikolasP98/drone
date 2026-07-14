@@ -32,34 +32,74 @@ jobs:
           node-version: "22.x"
           registry-url: "https://registry.npmjs.org"
 
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.4"
+
       - name: Install dependencies
         run: pnpm install --ignore-workspace --frozen-lockfile
 
       - name: Generate BAML client
         run: pnpm baml:generate
 
-      - name: Build
-        run: pnpm build
+      - name: Type-check
+        run: pnpm typecheck
 
       - name: Test
         run: pnpm test
 
+      - name: Validate release metadata
+        id: metadata
+        shell: bash
+        env:
+          DIST_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || 'latest' }}
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          if [[ "$GITHUB_EVENT_NAME" == "push" ]]; then
+            EXPECTED_TAG="v${PACKAGE_VERSION}"
+            if [[ "$GITHUB_REF_NAME" != "$EXPECTED_TAG" ]]; then
+              echo "Release tag $GITHUB_REF_NAME does not match package version $EXPECTED_TAG" >&2
+              exit 1
+            fi
+          fi
+          if [[ ! "$DIST_TAG" =~ ^[A-Za-z][A-Za-z0-9._-]*$ ]]; then
+            echo "Invalid npm dist-tag: $DIST_TAG" >&2
+            exit 1
+          fi
+          echo "dist_tag=$DIST_TAG" >> "$GITHUB_OUTPUT"
+
+      - name: Pack, install, and smoke release artifact
+        id: package
+        run: pnpm verify:package -- --pack-destination "$RUNNER_TEMP/drone-package"
+
       - name: Check if version already published
         id: version-check
+        shell: bash
+        env:
+          PKG_NAME: ${{ steps.package.outputs.package_name }}
+          PKG_VERSION: ${{ steps.package.outputs.package_version }}
         run: |
-          PKG_NAME=$(node -p "require('./package.json').name")
-          PKG_VERSION=$(node -p "require('./package.json').version")
-          if npm view "${PKG_NAME}@${PKG_VERSION}" version > /dev/null 2>&1; then
+          set -euo pipefail
+          set +e
+          npm view "${PKG_NAME}@${PKG_VERSION}" version --json > npm-view.json 2> npm-view.err
+          VIEW_STATUS=$?
+          set -e
+          if [[ $VIEW_STATUS -eq 0 ]]; then
             echo "${PKG_NAME}@${PKG_VERSION} already on registry — skipping"
             echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
+          elif grep -q "E404" npm-view.err; then
             echo "Publishing ${PKG_NAME}@${PKG_VERSION}"
             echo "skip=false" >> "$GITHUB_OUTPUT"
+          else
+            cat npm-view.err >&2
+            exit "$VIEW_STATUS"
           fi
 
       - name: Publish to npm
         if: steps.version-check.outputs.skip != 'true'
-        run: pnpm publish --no-git-checks --access public --tag "$DIST_TAG"
+        run: npm publish "$TARBALL" --access public --tag "$DIST_TAG"
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-          DIST_TAG: ${{ github.event.inputs.tag || 'latest' }}
+          TARBALL: ${{ steps.package.outputs.tarball }}
+          DIST_TAG: ${{ steps.metadata.outputs.dist_tag }}
