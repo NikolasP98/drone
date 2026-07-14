@@ -3,12 +3,13 @@ import {
   chmod,
   lstat,
   mkdir,
-  readFile,
+  open,
   readdir,
   rename,
   unlink,
   writeFile,
 } from "node:fs/promises";
+import { constants, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import path from "node:path";
 import type { TranscriptEntry, TranscriptRole } from "./state.js";
@@ -27,6 +28,7 @@ const MAX_PROVIDER_CHARS = 200;
 const MAX_MODEL_CHARS = 300;
 const MAX_CWD_CHARS = 4_096;
 const MAX_TRANSCRIPT_ID_CHARS = 200;
+const MAX_TIMESTAMP = 8_640_000_000_000_000;
 const SESSION_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const TRANSCRIPT_ROLES = new Set<TranscriptRole>(["user", "assistant", "system"]);
 
@@ -101,7 +103,7 @@ function positiveInteger(value: number | undefined, fallback: number, name: stri
 }
 
 function normalizeTimestamp(value: number, name: string): number {
-  if (!Number.isFinite(value) || value < 0) {
+  if (!Number.isFinite(value) || value < 0 || value > MAX_TIMESTAMP) {
     throw new Error(`${name} must be a non-negative finite number`);
   }
   return Math.floor(value);
@@ -127,13 +129,25 @@ function isMissingError(error: unknown): boolean {
   );
 }
 
+function canonicalWorkspacePath(cwd: string): string {
+  const resolved = path.resolve(cwd);
+  try {
+    return realpathSync(resolved);
+  } catch (error) {
+    // Keeping lexical support for not-yet-created embedding/test paths preserves the
+    // existing API, while real workspaces share identity across symlink aliases.
+    if (isMissingError(error)) return resolved;
+    throw error;
+  }
+}
+
 function getStateRoot(options: SessionHistoryStoreOptions): string {
   const stateHome = (options.env ?? process.env).XDG_STATE_HOME?.trim();
   return path.join(stateHome || path.join(options.homeDir ?? homedir(), ".local", "state"), "drone");
 }
 
 export function getWorkspaceSessionKey(cwd: string): string {
-  const resolved = path.resolve(cwd);
+  const resolved = canonicalWorkspacePath(cwd);
   return createHash("sha256")
     .update("drone-session-workspace\0", "utf8")
     .update(resolved, "utf8")
@@ -150,6 +164,10 @@ export function getSessionHistoryPaths(options: SessionHistoryStoreOptions): Ses
 
 async function ensurePrivateDirectory(directory: string): Promise<void> {
   await mkdir(directory, { recursive: true, mode: 0o700 });
+  const info = await lstat(directory);
+  if (info.isSymbolicLink() || !info.isDirectory()) {
+    throw new Error(`session history path is not a private directory: ${directory}`);
+  }
   await chmod(directory, 0o700);
 }
 
@@ -171,6 +189,7 @@ function normalizeTranscriptEntry(
     typeof entry.content !== "string" ||
     !Number.isFinite(entry.createdAt) ||
     entry.createdAt < 0 ||
+    entry.createdAt > MAX_TIMESTAMP ||
     (entry.streaming !== undefined && typeof entry.streaming !== "boolean")
   ) {
     return undefined;
@@ -210,7 +229,7 @@ function normalizeSnapshot(
   options: ResolvedStoreOptions,
 ): DroneSessionSnapshot {
   assertSessionId(input.id);
-  const cwd = path.resolve(boundedString(input.cwd, MAX_CWD_CHARS, "cwd"));
+  const cwd = canonicalWorkspacePath(boundedString(input.cwd, MAX_CWD_CHARS, "cwd"));
   if (cwd !== options.cwd) throw new Error("session cwd does not match history workspace");
   const createdAt = normalizeTimestamp(input.createdAt, "createdAt");
   const updatedAt = normalizeTimestamp(input.updatedAt, "updatedAt");
@@ -246,6 +265,7 @@ function parseTranscriptEntry(value: unknown, maxEntryChars: number): Transcript
     typeof value.createdAt !== "number" ||
     !Number.isFinite(value.createdAt) ||
     value.createdAt < 0 ||
+    value.createdAt > MAX_TIMESTAMP ||
     (value.streaming !== undefined && typeof value.streaming !== "boolean")
   ) {
     return undefined;
@@ -265,7 +285,7 @@ function parseSnapshot(value: unknown, options: ResolvedStoreOptions): DroneSess
     typeof value.id !== "string" ||
     !SESSION_ID.test(value.id) ||
     typeof value.cwd !== "string" ||
-    path.resolve(value.cwd) !== options.cwd ||
+    canonicalWorkspacePath(value.cwd) !== options.cwd ||
     typeof value.title !== "string" ||
     value.title.length > MAX_TITLE_CHARS ||
     typeof value.provider !== "string" ||
@@ -275,9 +295,11 @@ function parseSnapshot(value: unknown, options: ResolvedStoreOptions): DroneSess
     typeof value.createdAt !== "number" ||
     !Number.isFinite(value.createdAt) ||
     value.createdAt < 0 ||
+    value.createdAt > MAX_TIMESTAMP ||
     typeof value.updatedAt !== "number" ||
     !Number.isFinite(value.updatedAt) ||
     value.updatedAt < value.createdAt ||
+    value.updatedAt > MAX_TIMESTAMP ||
     !Array.isArray(value.transcript) ||
     value.transcript.length > options.maxTranscriptEntries
   ) {
@@ -321,11 +343,16 @@ async function readSnapshotFile(
     if (!filename.endsWith(".json")) return undefined;
     const expectedId = filename.slice(0, -".json".length);
     if (!SESSION_ID.test(expectedId)) return undefined;
-    const info = await lstat(file);
-    if (!info.isFile() || info.isSymbolicLink() || info.size > options.maxSessionBytes) return undefined;
-    const contents = await readFile(file, "utf8");
-    const snapshot = parseSnapshot(JSON.parse(contents) as unknown, options);
-    return snapshot?.id === expectedId ? snapshot : undefined;
+    const handle = await open(file, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const info = await handle.stat();
+      if (!info.isFile() || info.size > options.maxSessionBytes) return undefined;
+      const contents = await handle.readFile("utf8");
+      const snapshot = parseSnapshot(JSON.parse(contents) as unknown, options);
+      return snapshot?.id === expectedId ? snapshot : undefined;
+    } finally {
+      await handle.close();
+    }
   } catch {
     return undefined;
   }
@@ -384,7 +411,6 @@ async function atomicWriteSnapshot(
     await chmod(temporary, 0o600);
     await rename(temporary, target);
     temporaryExists = false;
-    await chmod(target, 0o600);
   } finally {
     if (temporaryExists) await unlink(temporary).catch(() => undefined);
   }
@@ -402,7 +428,7 @@ async function pruneSnapshots(options: ResolvedStoreOptions): Promise<void> {
 }
 
 function resolveStoreOptions(options: SessionHistoryStoreOptions): ResolvedStoreOptions {
-  const cwd = path.resolve(options.cwd);
+  const cwd = canonicalWorkspacePath(options.cwd);
   return {
     cwd,
     paths: getSessionHistoryPaths({ ...options, cwd }),

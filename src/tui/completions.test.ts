@@ -15,6 +15,10 @@ describe("slash command completions", () => {
       "config",
       "status",
       "clear",
+      "history",
+      "agents",
+      "spawn",
+      "close-agent",
       "model",
       "skills",
       "exit",
@@ -34,7 +38,19 @@ describe("slash command completions", () => {
 
   it("offers canonical commands for an empty slash query", () => {
     const labels = getCompletions({ prompt: "/", limit: 100 })?.items.map((item) => item.label);
-    expect(labels).toEqual(["/help", "/config", "/status", "/clear", "/model", "/skills", "/exit"]);
+    expect(labels).toEqual([
+      "/help",
+      "/config",
+      "/status",
+      "/clear",
+      "/history",
+      "/agents",
+      "/spawn",
+      "/close-agent",
+      "/model",
+      "/skills",
+      "/exit",
+    ]);
   });
 
   it("only treats a slash as a command in the first prompt token", () => {

@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { addUserTurn, clearConversation, createInitialTuiState, reduceStreamEvent } from "./state.js";
+import {
+  addUserTurn,
+  clearConversation,
+  createInitialTuiState,
+  reduceStreamEvent,
+  restoreConversation,
+} from "./state.js";
 
 describe("TUI state", () => {
   it("reduces a streamed turn into a completed transcript", () => {
@@ -50,5 +56,23 @@ describe("TUI state", () => {
     expect(cleared.transcript).toHaveLength(1);
     expect(cleared.status).toBe("idle");
     expect(cleared.activity.length).toBeLessThanOrEqual(3);
+  });
+
+  it("restores a persisted transcript as an idle, non-streaming conversation", () => {
+    const restored = restoreConversation([
+      { id: "user", role: "user", content: "hello", createdAt: 1 },
+      {
+        id: "assistant",
+        role: "assistant",
+        content: "hi",
+        createdAt: 2,
+        streaming: true,
+      },
+    ]);
+
+    expect(restored.status).toBe("idle");
+    expect(restored.transcript).toHaveLength(2);
+    expect(restored.transcript.every((entry) => entry.streaming === false)).toBe(true);
+    expect(restored.activity).toEqual([]);
   });
 });

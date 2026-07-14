@@ -31,6 +31,26 @@ export const SLASH_COMMANDS: readonly SlashCommandDefinition[] = [
     description: "Clear the conversation transcript",
   },
   {
+    name: "history",
+    usage: "/history",
+    description: "Browse and resume sessions from this workspace",
+  },
+  {
+    name: "agents",
+    usage: "/agents",
+    description: "Show or hide tmux-backed agent panes",
+  },
+  {
+    name: "spawn",
+    usage: "/spawn <name> [command]",
+    description: "Start a persistent shell or agent in a new pane",
+  },
+  {
+    name: "close-agent",
+    usage: "/close-agent <name>",
+    description: "Close a tmux-backed agent session",
+  },
+  {
     name: "model",
     usage: "/model <provider/model>",
     description: "Change the model for the current flight",
