@@ -1,16 +1,24 @@
 {
   "name": "@minion-stack/drone",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/NikolasP98/drone.git"
   },
-  "description": "Middle-tier mini-agent primitive: isolated LLM call with own model, system prompt, tools, and skills. Sits between forcedToolCall and runEmbeddedPiAgent.",
+  "description": "Minion's mini-agent primitive and interactive workspace Drone runtime.",
   "license": "MIT",
   "files": [
     "dist",
+    "docs",
     "README.md"
   ],
+  "bin": {
+    "drone": "./dist/cli.js"
+  },
+  "engines": {
+    "node": ">=22",
+    "bun": ">=1.3.0"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
@@ -26,6 +34,7 @@
   "scripts": {
     "baml:generate": "baml-cli generate --from baml_src",
     "build": "tsc -p tsconfig.build.json",
+    "dev": "bun src/cli.ts",
     "prepack": "tsc -p tsconfig.build.json",
     "test": "vitest run",
     "test:live": "vitest run --config vitest.live.config.ts",
@@ -39,8 +48,12 @@
     "vitest": "^4.1.7"
   },
   "peerDependencies": {
-    "@boundaryml/baml": "*",
-    "@earendil-works/pi-ai": "*",
-    "@sinclair/typebox": "*"
+    "@boundaryml/baml": "^0.84.0",
+    "@earendil-works/pi-ai": "0.75.5",
+    "@sinclair/typebox": "0.34.48"
+  },
+  "dependencies": {
+    "@opentui/core": "0.4.3",
+    "web-tree-sitter": "0.25.10"
   }
 }
