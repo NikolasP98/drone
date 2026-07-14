@@ -115,7 +115,15 @@ describe("workspace reads and search", () => {
     )) as { content: string; size: number; truncated: boolean };
     expect(read).toMatchObject({ content: "hello", size: 12, truncated: true });
 
-    const searched = (await tool(tools, "search_files").execute(
+    // Search must behave the same whether ripgrep is installed or the bounded
+    // filesystem fallback is used. Give the fallback enough bytes to inspect
+    // these fixtures; the smaller limit above is specific to read_file.
+    const searchTools = createWorkspaceTools({
+      cwd,
+      env: { PATH: "" },
+      maxReadBytes: 1_024,
+    });
+    const searched = (await tool(searchTools, "search_files").execute(
       { query: "drone", path: ".", maxResults: 10 },
       context,
     )) as { matches: Array<{ path: string; line: number; text: string }> };
