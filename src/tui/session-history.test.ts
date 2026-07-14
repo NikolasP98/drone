@@ -1,4 +1,13 @@
-import { mkdir, mkdtemp, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  stat,
+  symlink,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -63,6 +72,30 @@ describe("session history paths", () => {
   it("falls back to the user local state directory", () => {
     const paths = getSessionHistoryPaths({ cwd: "/work", env: {}, homeDir: "/home/tester" });
     expect(paths.root).toBe("/home/tester/.local/state/drone");
+  });
+
+  it("uses one canonical workspace identity through symlink aliases", async () => {
+    const stateHome = await temporaryDirectory();
+    const workspace = path.join(stateHome, "workspace");
+    const alias = path.join(stateHome, "workspace-link");
+    await mkdir(workspace);
+    await symlink(workspace, alias, "dir");
+
+    const direct = createSessionHistoryStore({
+      cwd: workspace,
+      env: { XDG_STATE_HOME: stateHome },
+    });
+    const linked = createSessionHistoryStore({
+      cwd: alias,
+      env: { XDG_STATE_HOME: stateHome },
+    });
+
+    expect(linked.cwd).toBe(workspace);
+    expect(linked.paths.workspaceKey).toBe(direct.paths.workspaceKey);
+    expect(linked.paths.workspace).toBe(direct.paths.workspace);
+
+    await linked.save(session(alias, "linked-session", 10));
+    await expect(direct.load("linked-session")).resolves.toMatchObject({ cwd: workspace });
   });
 });
 
@@ -161,5 +194,31 @@ describe("session persistence", () => {
 
     await mkdir(store.paths.workspace, { recursive: true });
     expect(await readdir(stateHome, { recursive: true })).not.toContain("escape.json");
+  });
+
+  it("refuses symlinked store directories and snapshot files", async () => {
+    const stateHome = await temporaryDirectory();
+    const redirected = await temporaryDirectory();
+    const cwd = path.join(stateHome, "workspace");
+    await symlink(redirected, path.join(stateHome, "drone"), "dir");
+    const redirectedStore = createSessionHistoryStore({
+      cwd,
+      env: { XDG_STATE_HOME: stateHome },
+    });
+    await expect(redirectedStore.save(session(cwd, "blocked", 10))).rejects.toThrow(
+      "not a private directory",
+    );
+
+    const cleanStateHome = await temporaryDirectory();
+    const store = createSessionHistoryStore({
+      cwd,
+      env: { XDG_STATE_HOME: cleanStateHome },
+    });
+    await store.save(session(cwd, "real", 20));
+    await symlink(
+      path.join(store.paths.workspace, "real.json"),
+      path.join(store.paths.workspace, "linked.json"),
+    );
+    await expect(store.load("linked")).resolves.toBeUndefined();
   });
 });

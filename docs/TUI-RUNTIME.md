@@ -73,6 +73,33 @@ The full-screen interface has three durable regions and one contextual region:
   activity, errors, and approval requests as distinct entries;
 - a focused composer for the next instruction.
 
+The contextual region can become a workspace-scoped tmux surface. `/agents`
+shows or hides it; `/spawn <name> [command]` creates a persistent shell window;
+and `/close-agent <name>` closes only that owned window. Multiple windows render
+side by side, with at most four owned windows per workspace and a responsive
+visible subset when the terminal is narrow. The divider between Drone and the
+agent surface, plus dividers between adjacent agent panes, support mouse
+dragging with bounded minimum pane sizes. Tab and Shift+Tab cycle through the
+composer, transcript, and agent inputs. `Ctrl+C` interrupts the focused agent
+shell instead of exiting Drone.
+
+Agent windows are grouped under a deterministic tmux session derived from the
+resolved workspace. Drone marks and verifies ownership before listing,
+capturing, sending input, interrupting, or closing a window; a colliding
+unmarked session fails closed. Pane output is control-sequence sanitized and
+bounded before entering the renderer. Drone never kills the whole session on
+TUI exit, so shells reconnect on the next run from the same workspace. This is
+interactive shell management, not autonomous background orchestration.
+
+`/history` opens private conversation history for the resolved workspace.
+Snapshots contain the transcript and provider/model metadata, live under
+`$XDG_STATE_HOME/drone/sessions` or `~/.local/state/drone/sessions`, and use
+hashed workspace directories rather than raw workspace names. Directories and
+files are mode 0700 and 0600 respectively. Writes are atomic and bounded;
+corrupt, oversized, symlinked, foreign-workspace, or invalid snapshots are
+ignored or rejected. Resuming restores the transcript into a new session id,
+preventing concurrent TUI processes from overwriting the same continuation.
+
 When the token at the composer caret begins with `/` or `@`, a completion
 palette appears directly above the composer without taking focus from it.
 Slash completion is available only for the first prompt token. A bare `@`
@@ -122,9 +149,10 @@ that traverse symbolic links. Shell commands start in the workspace and share
 the configured output cap.
 
 `write_file` uses Linux descriptor-relative traversal (`/proc/self/fd`) so
-parent creation and the final open remain anchored to the verified workspace.
-It refuses symbolic path components and fails closed on non-Linux platforms
-until an equivalent descriptor-relative implementation is available there.
+parent creation and the atomic temporary-write/rename remain anchored to the
+verified workspace. It refuses symbolic path components, preserves an existing
+file's mode, and fails closed on non-Linux platforms until an equivalent
+descriptor-relative implementation is available there.
 
 The renderer must remain usable as the terminal is resized and must not print a
 new full screen for every streamed token or animation frame. Long tool output is
@@ -162,6 +190,12 @@ The minimum stable keymap is:
 | Show help | `?` or `/help` |
 | Show resolved configuration | `/config` |
 | Browse or toggle skills | `/skills [name]` |
+| Browse or resume history | `/history`, then `Up` / `Down` and `Enter` |
+| Show or hide agent panes | `/agents` |
+| Create an agent shell | `/spawn <name> [command]` |
+| Focus Drone/transcript/agent inputs | `Tab` / `Shift+Tab` |
+| Interrupt a focused agent shell | `Ctrl+C` |
+| Close an agent shell | `/close-agent <name>` |
 | Clear the transcript | `/clear` |
 | Show runtime status | `/status` |
 | Exit | `/exit`, or `Ctrl+C` while idle |
@@ -171,7 +205,7 @@ click handling is disabled. Completion rows support hover selection and
 click-to-insert when mouse clicks are enabled; all completion actions retain
 the composer focus and never execute the inserted command on the same click.
 Clicking the composer focuses it;
-clicking footer Help, Config, Clear, or Quit performs the corresponding slash
+clicking footer Help, History, Agents, Config, Clear, or Quit performs the corresponding slash
 command; approval buttons provide **Allow once** and **Deny**. On-screen hints
 are the source of truth for context-sensitive focus and approval keys. Changing
 a mouse target must update its keyboard path in the same change.
@@ -313,6 +347,13 @@ default; granting a command does not implicitly grant the model every secret in
 the parent shell. Commands run in a non-login Bash process with profile and
 non-interactive startup files disabled.
 
+Tmux panes are a separate, explicitly user-driven surface. `runtime.allowShell:
+false` disables them. Text entered into an agent pane or the optional command in
+`/spawn` is executed by the user's configured tmux shell; it is not model tool
+output and does not pass through the model approval modal. Pane capture and
+input target only Drone-owned workspace windows and use tmux argument arrays
+and private paste buffers rather than interpolated host shell commands.
+
 ## Plain and JSON fallbacks
 
 `--print` runs one prompt to completion without the full-screen renderer.
@@ -376,13 +417,14 @@ provider's normal credentials.
 The first local runtime does not provide:
 
 - ACP client/server compatibility or remote editor attachment;
-- durable session persistence, restart recovery, or `drone resume`;
 - background daemon behavior or unattended Workforce orchestration;
 - a VM/container sandbox or privilege boundary;
 - a way to edit or bypass the fixed Workforce registry from local config;
-- multi-agent orchestration or a claim of feature parity with another coding
-  agent's private runtime.
+- cross-device history sync, automatic session merging, or unattended agent
+  scheduling;
+- a claim of feature parity with another coding agent's private runtime.
 
-ACP integration and durable resume are explicit future extensions. They must
-preserve this document's workspace, approval, output-mode, and terminal-cleanup
-contracts rather than being smuggled into the first release.
+ACP integration and remote history synchronization are explicit future
+extensions. They must preserve this document's workspace, approval,
+output-mode, and terminal-cleanup contracts rather than being smuggled into the
+first release.

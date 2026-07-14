@@ -193,3 +193,15 @@ export function clearConversation(state: DroneTuiState, now = Date.now()): Drone
   const initial = createInitialTuiState(now);
   return { ...initial, activity: state.activity.slice(-3) };
 }
+
+export function restoreConversation(
+  transcript: readonly TranscriptEntry[],
+  now = Date.now(),
+): DroneTuiState {
+  const initial = createInitialTuiState(now);
+  if (transcript.length === 0) return initial;
+  return {
+    ...initial,
+    transcript: transcript.map((entry) => ({ ...entry, streaming: false })),
+  };
+}

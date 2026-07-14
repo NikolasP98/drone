@@ -28,18 +28,34 @@ controls. Bare `@` shows the current directory; typed text searches recursively
 by substring, and `@~/` or `@../` temporarily search home or a parent without
 changing Drone's runtime workspace. Keyboard paths exist for every mouse action.
 
+`/history` opens a mouse- and keyboard-navigable history for the current
+workspace. Conversations are stored privately under `$XDG_STATE_HOME/drone`
+(or `~/.local/state/drone`) and resuming always creates a new fork, so two TUI
+processes cannot overwrite one another's continuation.
+
+When `tmux` is installed, `/spawn <name> [command]` opens a persistent agent
+shell (up to four per workspace) and `/agents` toggles live side-by-side panes.
+Use Tab to focus pane inputs, `Ctrl+C` to interrupt the focused shell,
+`/close-agent <name>` to close one, and drag either divider with the mouse to
+resize the Drone/agent split or adjacent agent panes. Shell windows remain
+available when the TUI exits and are reconnected the next time `drone` runs in
+that workspace.
+
 ```bash
 drone "summarize this repository"   # launch and submit an initial prompt
 drone -p "list the main packages"   # read-only plain output
 drone --json "inspect package.json" # DroneStreamEvent JSONL
 drone config                        # resolved config and config paths
+drone                               # then /history, /agents, or /spawn worker
 ```
 
 User settings live at `~/.config/drone/config.json` (or
 `$XDG_CONFIG_HOME/drone/config.json`); workspace overrides live at
 `.drone/config.json`. API keys stay in the environment or workspace `.env` and
-are never persisted by Drone. Project config can tighten runtime safety but
-cannot enable shell/writes or disable approvals. See
+are never persisted by Drone. Session transcripts are persisted separately as
+private history files, so prompts and responses should be treated as local user
+data. Project config can tighten runtime safety but cannot enable shell/writes
+or disable approvals. See
 [the TUI/runtime contract](docs/TUI-RUNTIME.md) for configuration, controls,
 fallbacks, and the security boundary.
 

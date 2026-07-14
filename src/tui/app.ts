@@ -24,9 +24,15 @@ import {
   createWorkspaceTools,
   type WorkspaceApprovalRequest,
 } from "../runtime/workspace.js";
+import {
+  createTmuxSessionManager,
+  TmuxRuntimeError,
+  type TmuxAgentSession,
+} from "../runtime/tmux-sessions.js";
 import type { Drone, DroneStreamEvent } from "../types.js";
 import {
   approvalDecisionForKey,
+  escapeApprovalText,
   formatApprovalPreview,
 } from "./approval.js";
 import { renderDroneArt } from "./art.js";
@@ -39,11 +45,18 @@ import {
   type CompletionModel,
 } from "./completions.js";
 import { resolvePathSearchScope, type PathSearchScope } from "./path-scope.js";
+import { clampDroneSplit, resizePaneBoundary, visiblePaneCapacity } from "./pane-layout.js";
+import {
+  createSessionHistoryStore,
+  type DroneSessionSummary,
+  type SaveDroneSessionInput,
+} from "./session-history.js";
 import {
   addUserTurn,
   clearConversation,
   createInitialTuiState,
   reduceStreamEvent,
+  restoreConversation,
   type DroneTuiState,
   type TranscriptEntry,
 } from "./state.js";
@@ -76,6 +89,18 @@ type MessageView = {
   body: MarkdownRenderable;
 };
 
+type AgentPaneView = {
+  session: TmuxAgentSession;
+  box: BoxRenderable;
+  title: TextRenderable;
+  outputViewport: ScrollBoxRenderable;
+  output: TextRenderable;
+  input: TextareaRenderable;
+  weight: number;
+};
+
+type Panel = "help" | "config" | "history";
+
 const HELP = [
   "DRONE FLIGHT CONTROLS",
   "",
@@ -90,7 +115,8 @@ const HELP = [
   "",
   "Type / for commands or @ for workspace files and directories.",
   `Commands: ${SLASH_COMMANDS.slice(0, 4).map((command) => command.usage).join("  ")}`,
-  `          ${SLASH_COMMANDS.slice(4).map((command) => command.usage).join("  ")}`,
+  `          ${SLASH_COMMANDS.slice(4, 8).map((command) => command.usage).join("  ")}`,
+  `          ${SLASH_COMMANDS.slice(8).map((command) => command.usage).join("  ")}`,
   "",
   "Mouse: scroll the transcript, select to copy, or click footer actions.",
 ].join("\n");
@@ -100,6 +126,8 @@ const TUI_TERMINATION_EXIT_CODES: Readonly<Record<string, number>> = {
   SIGHUP: 129,
   SIGTERM: 143,
 };
+
+const MAX_AGENT_PANES = 4;
 
 /** Signals a failure after the full-screen session began, so the CLI must not replay its prompt. */
 export class DroneTuiSessionError extends Error {
@@ -117,6 +145,22 @@ export class DroneTuiSessionError extends Error {
 function formatDuration(ms: number | undefined): string {
   if (ms == null) return "—";
   return ms >= 1000 ? `${(ms / 1000).toFixed(1)}s` : `${ms}ms`;
+}
+
+function formatSessionTime(timestamp: number): string {
+  const date = new Date(timestamp);
+  if (!Number.isFinite(timestamp) || Number.isNaN(date.getTime())) return "unknown time";
+  const day = date.toISOString().slice(0, 10);
+  const time = date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return `${day} ${time}`;
+}
+
+function isSafeProviderId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,199}$/u.test(value);
+}
+
+function isSafeModelId(value: string): boolean {
+  return /^[A-Za-z0-9][A-Za-z0-9._:/+@-]{0,299}$/u.test(value);
 }
 
 function isBusy(state: DroneTuiState): boolean {
@@ -240,14 +284,44 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     });
     syntaxStyle = activeSyntaxStyle;
 
+  const historyStore = createSessionHistoryStore({ cwd: workspaceRoot });
+  const tmuxAbortController = new AbortController();
+  const tmuxManager = createTmuxSessionManager({
+    cwd: workspaceRoot,
+    abortSignal: tmuxAbortController.signal,
+  });
   let state = createInitialTuiState();
+  let sessionId: string = randomUUID();
+  let sessionCreatedAt = Date.now();
+  let sessionSaveTimer: NodeJS.Timeout | undefined;
+  let sessionSaveQueue = Promise.resolve();
+  let sessionPersistenceError: string | undefined;
+  let sessionHistoryNotice: string | undefined;
+  let sessionTransitionPending = false;
   let frame = 0;
   let frameElapsed = 0;
   let animationLive = false;
   let activeAbort: AbortController | undefined;
   let activeDeadlineAt: number | undefined;
+  const activeSubmitSettlements = new Set<Promise<void>>();
   let pendingApproval: ApprovalDecision | undefined;
-  let panel: "help" | "config" | undefined;
+  let panel: Panel | undefined;
+  let historyItems: DroneSessionSummary[] = [];
+  let historySelectedIndex = 0;
+  let historyLoading = false;
+  let historyOperationGeneration = 0;
+  let agentsVisible = false;
+  let agentSessions: TmuxAgentSession[] = [];
+  const agentViews = new Map<string, AgentPaneView>();
+  const agentPaneWeights = new Map<string, number>();
+  let droneSplit = 0.5;
+  let agentRefreshTimer: NodeJS.Timeout | undefined;
+  let agentRefreshBusy = false;
+  let agentRefreshGeneration = 0;
+  let agentOperationGeneration = 0;
+  let agentRuntimeError: string | undefined;
+  let agentLayoutSignature = "uninitialized";
+  let hiddenAgentSessions = 0;
   let finished = false;
   let workspaceReferences: WorkspaceReference[] = [];
   const referenceIndexes = new Map<
@@ -322,6 +396,40 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     viewportCulling: true,
   });
   main.add(transcript);
+
+  const droneAgentDivider = new BoxRenderable(renderer, {
+    id: "drone-agent-divider",
+    width: 1,
+    height: "100%",
+    visible: false,
+    backgroundColor: palette.border,
+    onMouseDrag: (event) => {
+      if (!config.ui.mouseClicks || !agentsVisible) return;
+      droneSplit = clampDroneSplit(event.x, renderer.width);
+      syncLayout();
+      void refreshAgentPanes();
+      renderer.requestRender();
+      event.preventDefault();
+      event.stopPropagation();
+    },
+    onMouseOver() {
+      if (config.ui.mouseClicks) this.backgroundColor = palette.accent;
+    },
+    onMouseOut() {
+      this.backgroundColor = palette.border;
+    },
+  });
+  main.add(droneAgentDivider);
+
+  const agentArea = new BoxRenderable(renderer, {
+    id: "agent-area",
+    height: "100%",
+    flexGrow: 1,
+    visible: false,
+    flexDirection: "row",
+    backgroundColor: palette.background,
+  });
+  main.add(agentArea);
 
   const inspector = new BoxRenderable(renderer, {
     id: "inspector",
@@ -425,7 +533,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
       const value = composer.plainText.trim();
       if (!value) return;
       composer.clear();
-      void submit(value);
+      startSubmit(value);
     },
   });
   composerBox.add(composer);
@@ -475,8 +583,10 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     return box;
   }
   button("help-button", "? Help", () => togglePanel("help"));
+  button("history-button", "History", () => void toggleHistoryPanel());
+  button("agents-button", "Agents", () => void toggleAgentPanes());
   button("config-button", "⚙ Config", () => togglePanel("config"));
-  button("clear-button", "Clear", () => clearAll());
+  button("clear-button", "Clear", () => void clearAll());
   button("quit-button", "Quit", () => finish());
 
   const modal = new BoxRenderable(renderer, {
@@ -489,6 +599,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     top: "10%",
     left: "20%",
     zIndex: 50,
+    focusable: true,
     visible: false,
     flexDirection: "column",
     border: true,
@@ -503,6 +614,16 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     fg: palette.text,
     flexGrow: 1,
   });
+  const historyViewport = new ScrollBoxRenderable(renderer, {
+    id: "history-viewport",
+    width: "100%",
+    flexGrow: 1,
+    scrollY: true,
+    viewportCulling: true,
+    visible: false,
+    backgroundColor: palette.surfaceRaised,
+  });
+  modal.add(historyViewport);
   const modalHint = addText(renderer, modal, "modal-hint", "", { fg: palette.muted });
 
   const approvalModal = new BoxRenderable(renderer, {
@@ -630,6 +751,616 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
         existing.body.content = entry.content || " ";
         existing.body.streaming = entry.streaming ?? false;
       }
+    }
+  }
+
+  function captureSession(): SaveDroneSessionInput | undefined {
+    const firstUserTurn = state.transcript.find(
+      (entry) => entry.role === "user" && entry.content.trim().length > 0,
+    );
+    if (!firstUserTurn) return undefined;
+    const title = firstUserTurn.content.replace(/\s+/gu, " ").trim().slice(0, 72);
+    return {
+      id: sessionId,
+      cwd: workspaceRoot,
+      title: title || "Untitled flight",
+      provider: config.provider,
+      model: config.model,
+      createdAt: sessionCreatedAt,
+      updatedAt: Date.now(),
+      transcript: state.transcript,
+    };
+  }
+
+  function persistSessionNow(): Promise<boolean> {
+    if (sessionSaveTimer) {
+      clearTimeout(sessionSaveTimer);
+      sessionSaveTimer = undefined;
+    }
+    const snapshot = captureSession();
+    if (!snapshot) return sessionSaveQueue.then(() => true);
+    const attempt = sessionSaveQueue.then(async () => {
+      let persisted = false;
+      try {
+        await historyStore.save(snapshot);
+        sessionPersistenceError = undefined;
+        persisted = true;
+      } catch (error) {
+        sessionPersistenceError = error instanceof Error ? error.message : String(error);
+      }
+      if (!finished && !renderer.isDestroyed) syncView();
+      return persisted;
+    });
+    sessionSaveQueue = attempt.then(() => undefined);
+    return attempt;
+  }
+
+  function scheduleSessionPersistence(): void {
+    if (!captureSession() || finished) return;
+    if (sessionSaveTimer) clearTimeout(sessionSaveTimer);
+    sessionSaveTimer = setTimeout(() => {
+      sessionSaveTimer = undefined;
+      void persistSessionNow();
+    }, 350);
+  }
+
+  function renderHistoryPanel(): void {
+    removeChildren(historyViewport);
+    if (historyLoading) {
+      addText(renderer, historyViewport, "history-loading", "Loading sessions…", {
+        fg: palette.muted,
+      });
+      return;
+    }
+    if (sessionPersistenceError || sessionHistoryNotice) {
+      addText(
+        renderer,
+        historyViewport,
+        "history-warning",
+        sessionPersistenceError
+          ? `History save failed: ${escapeApprovalText(sessionPersistenceError)}`
+          : escapeApprovalText(sessionHistoryNotice ?? ""),
+        { fg: sessionPersistenceError ? palette.error : palette.warning },
+      );
+    }
+    if (historyItems.length === 0) {
+      addText(
+        renderer,
+        historyViewport,
+        "history-empty",
+        "No saved sessions for this workspace yet.",
+        { fg: palette.muted },
+      );
+      return;
+    }
+
+    historySelectedIndex = Math.max(0, Math.min(historySelectedIndex, historyItems.length - 1));
+    historyItems.forEach((item, index) => {
+      const selected = index === historySelectedIndex;
+      const current = item.id === sessionId;
+      const row = new BoxRenderable(renderer, {
+        id: `history-row-${item.id}`,
+        width: "100%",
+        height: 3,
+        flexDirection: "column",
+        paddingX: 1,
+        marginBottom: 1,
+        border: selected ? ["left"] : false,
+        borderColor: palette.accent,
+        backgroundColor: selected ? palette.accentSoft : palette.surfaceRaised,
+        onMouseDown: (event) => {
+          if (!config.ui.mouseClicks) return;
+          event.preventDefault();
+          event.stopPropagation();
+          historySelectedIndex = index;
+          void loadHistorySession(item.id);
+        },
+      });
+      addText(
+        renderer,
+        row,
+        `history-title-${item.id}`,
+        `${selected ? "›" : " "} ${current ? "●" : "○"} ${escapeApprovalText(item.title).replace(/\s+/gu, " ")}`,
+        { fg: selected ? palette.text : palette.muted, wrapMode: "none" },
+      );
+      addText(
+        renderer,
+        row,
+        `history-meta-${item.id}`,
+        `  ${formatSessionTime(item.updatedAt)} · ${escapeApprovalText(item.provider)}/${escapeApprovalText(item.model)} · ${item.transcriptEntries} messages`,
+        { fg: palette.muted, wrapMode: "none" },
+      );
+      historyViewport.add(row);
+    });
+    queueMicrotask(() => {
+      if (panel === "history") {
+        historyViewport.scrollChildIntoView(`history-row-${historyItems[historySelectedIndex]?.id}`);
+      }
+    });
+  }
+
+  async function refreshHistoryPanel(): Promise<void> {
+    if (historyLoading) return;
+    const generation = ++historyOperationGeneration;
+    historyLoading = true;
+    renderHistoryPanel();
+    renderer.requestRender();
+    try {
+      const items = await historyStore.list();
+      if (generation !== historyOperationGeneration || finished) return;
+      historyItems = items;
+      const currentIndex = items.findIndex((item) => item.id === sessionId);
+      historySelectedIndex = currentIndex >= 0 ? currentIndex : 0;
+    } catch (error) {
+      if (generation === historyOperationGeneration) {
+        historyItems = [];
+        sessionPersistenceError = error instanceof Error ? error.message : String(error);
+      }
+    } finally {
+      if (generation === historyOperationGeneration) historyLoading = false;
+      if (generation === historyOperationGeneration && panel === "history" && !renderer.isDestroyed) {
+        renderHistoryPanel();
+        renderer.requestRender();
+      }
+    }
+  }
+
+  function moveHistorySelection(delta: number): void {
+    if (historyItems.length === 0) return;
+    historySelectedIndex =
+      (historySelectedIndex + delta + historyItems.length) % historyItems.length;
+    renderHistoryPanel();
+    renderer.requestRender();
+  }
+
+  async function loadHistorySession(id = historyItems[historySelectedIndex]?.id): Promise<void> {
+    if (!id || isBusy(state) || sessionTransitionPending) return;
+    sessionTransitionPending = true;
+    const generation = ++historyOperationGeneration;
+    historyLoading = false;
+    try {
+      const persisted = await persistSessionNow();
+      if (!persisted) {
+        sessionHistoryNotice = "The current session could not be checkpointed; resume was cancelled.";
+        if (!finished && !renderer.isDestroyed) syncView();
+        return;
+      }
+      if (isBusy(state) || finished || generation !== historyOperationGeneration) return;
+      const snapshot = await historyStore.load(id);
+      if (!snapshot || finished || generation !== historyOperationGeneration) {
+        if (!snapshot) sessionHistoryNotice = "That saved session is no longer available.";
+        return;
+      }
+      const safeModel = isSafeProviderId(snapshot.provider) && isSafeModelId(snapshot.model);
+      sessionId = randomUUID();
+      sessionCreatedAt = Date.now();
+      sessionHistoryNotice = safeModel
+        ? "Resumed a saved session as a new session fork."
+        : "Saved provider/model metadata was invalid; the current model was retained.";
+      if (safeModel) {
+        config.provider = snapshot.provider;
+        config.model = snapshot.model;
+      }
+      state = restoreConversation(snapshot.transcript);
+      drone = buildDrone();
+      panel = undefined;
+      historyViewport.visible = false;
+      modalBody.visible = true;
+      syncView();
+      composer.focus();
+    } finally {
+      sessionTransitionPending = false;
+    }
+  }
+
+  function describeAgentError(error: unknown): string {
+    if (error instanceof TmuxRuntimeError) return `${error.code}: ${error.message}`;
+    return error instanceof Error ? error.message : String(error);
+  }
+
+  function agentUiAlive(generation: number): boolean {
+    return (
+      generation === agentOperationGeneration &&
+      !finished &&
+      !renderer.isDestroyed
+    );
+  }
+
+  function applyAgentPaneWeights(): void {
+    for (const session of agentSessions) {
+      const view = agentViews.get(session.id);
+      if (!view) continue;
+      const weight = agentPaneWeights.get(session.id) ?? 1;
+      view.weight = weight;
+      view.box.flexGrow = weight;
+    }
+  }
+
+  function createAgentDivider(boundaryIndex: number): BoxRenderable {
+    return new BoxRenderable(renderer, {
+      id: `agent-divider-${boundaryIndex}`,
+      width: 1,
+      height: "100%",
+      backgroundColor: palette.border,
+      onMouseDrag(event) {
+        if (!config.ui.mouseClicks || agentArea.width <= 0) return;
+        const weights = agentSessions.map((session) => agentPaneWeights.get(session.id) ?? 1);
+        const next = resizePaneBoundary(
+          weights,
+          boundaryIndex,
+          (event.x - agentArea.x) / agentArea.width,
+        );
+        agentSessions.forEach((session, index) => {
+          agentPaneWeights.set(session.id, next[index] ?? 1);
+        });
+        applyAgentPaneWeights();
+        renderer.requestRender();
+        event.preventDefault();
+        event.stopPropagation();
+      },
+      onMouseOver() {
+        if (config.ui.mouseClicks) this.backgroundColor = palette.accent;
+      },
+      onMouseOut() {
+        this.backgroundColor = palette.border;
+      },
+    });
+  }
+
+  function rebuildAgentPanes(): void {
+    const focusedAgentId = [...agentViews].find(
+      ([, view]) => renderer.currentFocusedRenderable === view.input,
+    )?.[0];
+    const previousOutput = new Map(
+      [...agentViews].map(([id, view]) => [id, view.output.content.toString()]),
+    );
+    removeChildren(agentArea);
+    agentViews.clear();
+    const liveIds = new Set(agentSessions.map((session) => session.id));
+    for (const id of agentPaneWeights.keys()) {
+      if (!liveIds.has(id)) agentPaneWeights.delete(id);
+    }
+
+    if (agentSessions.length === 0) {
+      addText(
+        renderer,
+        agentArea,
+        "agents-empty",
+        agentRuntimeError
+          ? `TMUX RUNTIME ERROR\n${escapeApprovalText(agentRuntimeError)}`
+          : "NO AGENT SHELLS\n\nUse /spawn <name> [command] to open a persistent tmux-backed pane.",
+        { fg: agentRuntimeError ? palette.error : palette.muted, flexGrow: 1 },
+      );
+      agentLayoutSignature = "";
+      if (focusedAgentId) queueMicrotask(() => composer.focus());
+      return;
+    }
+
+    agentSessions.forEach((session, index) => {
+      if (!agentPaneWeights.has(session.id)) agentPaneWeights.set(session.id, 1);
+      const box = new BoxRenderable(renderer, {
+        id: `agent-pane-${session.id.slice(1)}`,
+        height: "100%",
+        flexGrow: agentPaneWeights.get(session.id),
+        flexDirection: "column",
+        paddingX: 1,
+        backgroundColor: palette.surface,
+      });
+      const title = addText(renderer, box, `agent-title-${session.id.slice(1)}`, "", {
+        fg: session.dead ? palette.error : palette.accent,
+        wrapMode: "none",
+      });
+      const outputViewport = new ScrollBoxRenderable(renderer, {
+        id: `agent-output-${session.id.slice(1)}`,
+        width: "100%",
+        flexGrow: 1,
+        scrollY: true,
+        stickyScroll: true,
+        stickyStart: "bottom",
+        viewportCulling: true,
+        backgroundColor: palette.background,
+      });
+      box.add(outputViewport);
+      const output = addText(
+        renderer,
+        outputViewport,
+        `agent-output-text-${session.id.slice(1)}`,
+        previousOutput.get(session.id) ?? "Waiting for shell output…",
+        { fg: palette.text },
+      );
+      const inputBox = new BoxRenderable(renderer, {
+        id: `agent-input-box-${session.id.slice(1)}`,
+        width: "100%",
+        height: 3,
+        border: true,
+        borderColor: palette.borderFocus,
+        focusedBorderColor: palette.accent,
+        paddingX: 1,
+        backgroundColor: palette.surfaceRaised,
+      });
+      box.add(inputBox);
+      const input = new TextareaRenderable(renderer, {
+        id: `agent-input-${session.id.slice(1)}`,
+        width: "100%",
+        height: "100%",
+        placeholder: "send to shell…",
+        placeholderColor: palette.muted,
+        textColor: palette.text,
+        cursorColor: palette.accent,
+        backgroundColor: palette.surfaceRaised,
+        keyBindings: [
+          ...defaultTextareaKeyBindings.filter(
+            (binding) =>
+              !(
+                (binding.name === "return" || binding.name === "kpenter") &&
+                (binding.action === "newline" || binding.action === "submit")
+              ),
+          ),
+          { name: "return", action: "submit" },
+          { name: "kpenter", action: "submit" },
+          { name: "return", meta: true, action: "newline" },
+          { name: "kpenter", meta: true, action: "newline" },
+        ],
+        onSubmit: () => {
+          const value = input.plainText;
+          input.clear();
+          void sendAgentInput(session.id, value);
+        },
+      });
+      inputBox.add(input);
+      const view: AgentPaneView = {
+        session,
+        box,
+        title,
+        outputViewport,
+        output,
+        input,
+        weight: agentPaneWeights.get(session.id) ?? 1,
+      };
+      title.content = `${session.dead ? "×" : "◆"} ${escapeApprovalText(session.name)} · ${escapeApprovalText(session.currentCommand || "shell")}`;
+      agentViews.set(session.id, view);
+      agentArea.add(box);
+      if (index < agentSessions.length - 1) agentArea.add(createAgentDivider(index));
+    });
+    agentLayoutSignature = agentSessions.map((session) => session.id).join("\0");
+    applyAgentPaneWeights();
+    if (focusedAgentId) {
+      queueMicrotask(() => (agentViews.get(focusedAgentId)?.input ?? composer).focus());
+    }
+  }
+
+  async function refreshAgentPanes(): Promise<void> {
+    if (!agentsVisible || agentRefreshBusy || finished) return;
+    const generation = agentRefreshGeneration;
+    agentRefreshBusy = true;
+    try {
+      const allSessions = await tmuxManager.list();
+      if (
+        generation !== agentRefreshGeneration ||
+        !agentsVisible ||
+        finished ||
+        renderer.isDestroyed
+      ) {
+        return;
+      }
+      const capacity = visiblePaneCapacity(renderer.width, 1 - droneSplit, MAX_AGENT_PANES);
+      hiddenAgentSessions = Math.max(0, allSessions.length - capacity);
+      const sessions = allSessions.slice(0, capacity);
+      const hadRuntimeError = agentRuntimeError !== undefined;
+      agentRuntimeError = undefined;
+      agentSessions = sessions;
+      const signature = sessions.map((session) => session.id).join("\0");
+      if (signature !== agentLayoutSignature || hadRuntimeError) rebuildAgentPanes();
+      for (const session of sessions) {
+        const view = agentViews.get(session.id);
+        if (!view) continue;
+        view.session = session;
+        view.title.fg = session.dead ? palette.error : palette.accent;
+        view.title.content = `${session.dead ? "×" : "◆"} ${escapeApprovalText(session.name)} · ${escapeApprovalText(session.currentCommand || "shell")}`;
+      }
+      await Promise.all(
+        sessions.map(async (session) => {
+          const view = agentViews.get(session.id);
+          if (!view) return;
+          try {
+            const capture = await tmuxManager.capture(session.id, {
+              historyLines: 800,
+              maxChars: 60_000,
+            });
+            if (
+              generation !== agentRefreshGeneration ||
+              !agentsVisible ||
+              finished ||
+              renderer.isDestroyed
+            ) {
+              return;
+            }
+            view.output.content = `${capture.truncated ? "… earlier output truncated …\n" : ""}${capture.text || " "}`;
+          } catch (error) {
+            if (
+              generation !== agentRefreshGeneration ||
+              !agentsVisible ||
+              finished ||
+              renderer.isDestroyed
+            ) {
+              return;
+            }
+            view.output.content = `Unable to capture pane: ${escapeApprovalText(describeAgentError(error))}`;
+          }
+        }),
+      );
+      if (
+        generation !== agentRefreshGeneration ||
+        !agentsVisible ||
+        finished ||
+        renderer.isDestroyed
+      ) {
+        return;
+      }
+      renderer.requestRender();
+    } catch (error) {
+      if (
+        generation !== agentRefreshGeneration ||
+        !agentsVisible ||
+        finished ||
+        renderer.isDestroyed
+      ) {
+        return;
+      }
+      agentRuntimeError = describeAgentError(error);
+      agentSessions = [];
+      rebuildAgentPanes();
+      renderer.requestRender();
+    } finally {
+      agentRefreshBusy = false;
+    }
+  }
+
+  function startAgentRefresh(): void {
+    if (agentRefreshTimer) return;
+    agentRefreshTimer = setInterval(() => void refreshAgentPanes(), 1_200);
+    agentRefreshTimer.unref();
+  }
+
+  function stopAgentRefresh(): void {
+    agentRefreshGeneration += 1;
+    if (agentRefreshTimer) {
+      clearInterval(agentRefreshTimer);
+      agentRefreshTimer = undefined;
+    }
+  }
+
+  async function toggleAgentPanes(): Promise<void> {
+    if (agentsVisible) {
+      agentOperationGeneration += 1;
+      agentsVisible = false;
+      stopAgentRefresh();
+      syncView();
+      composer.focus();
+      return;
+    }
+    const generation = agentOperationGeneration;
+    if (!config.runtime.allowShell) {
+      addSystemMessage("Agent shells are disabled by `runtime.allowShell: false`.");
+      return;
+    }
+    try {
+      const available = await tmuxManager.isAvailable();
+      if (!agentUiAlive(generation)) return;
+      if (!available) {
+        addSystemMessage("Agent panes require tmux on `PATH`. Install tmux, then retry `/agents`.");
+        return;
+      }
+      agentsVisible = true;
+      syncView();
+      await refreshAgentPanes();
+      if (!agentUiAlive(generation)) return;
+      startAgentRefresh();
+    } catch (error) {
+      if (!agentUiAlive(generation)) return;
+      agentRuntimeError = describeAgentError(error);
+      addSystemMessage(`Unable to open agent panes: ${escapeApprovalText(agentRuntimeError)}`);
+    }
+  }
+
+  async function spawnAgent(name: string, command?: string): Promise<void> {
+    if (!config.runtime.allowShell) {
+      addSystemMessage("Agent shells are disabled by `runtime.allowShell: false`.");
+      return;
+    }
+    const generation = agentOperationGeneration;
+    try {
+      const existing = await tmuxManager.list();
+      if (!agentUiAlive(generation)) return;
+      if (existing.length >= MAX_AGENT_PANES) {
+        addSystemMessage(
+          `Drone supports up to ${MAX_AGENT_PANES} live agent panes per workspace. Close one before spawning another.`,
+        );
+        return;
+      }
+      if (existing.some((session) => session.name.toLowerCase() === name.toLowerCase())) {
+        addSystemMessage(`An agent pane named **${escapeApprovalText(name)}** already exists.`);
+        return;
+      }
+      await tmuxManager.create({ name, ...(command ? { command } : {}) });
+      if (!agentUiAlive(generation)) return;
+      agentsVisible = true;
+      syncView();
+      await refreshAgentPanes();
+      if (!agentUiAlive(generation)) return;
+      startAgentRefresh();
+      addSystemMessage(`Opened tmux agent pane **${escapeApprovalText(name)}**.`);
+    } catch (error) {
+      if (!agentUiAlive(generation)) return;
+      agentRuntimeError = describeAgentError(error);
+      addSystemMessage(`Unable to spawn agent: ${escapeApprovalText(agentRuntimeError)}`);
+    }
+  }
+
+  async function closeAgent(name: string): Promise<void> {
+    const generation = agentOperationGeneration;
+    try {
+      const sessions = await tmuxManager.list();
+      if (!agentUiAlive(generation)) return;
+      const matches = sessions.filter(
+        (candidate) => candidate.id === name || candidate.name.toLowerCase() === name.toLowerCase(),
+      );
+      if (matches.length > 1) {
+        addSystemMessage(
+          `More than one agent is named **${escapeApprovalText(name)}**. Close one by id: ${matches.map((candidate) => `\`${candidate.id}\``).join(", ")}.`,
+        );
+        return;
+      }
+      const session = matches[0];
+      if (!session) {
+        addSystemMessage(`No tmux agent named **${escapeApprovalText(name)}** was found.`);
+        return;
+      }
+      await tmuxManager.close(session.id);
+      if (!agentUiAlive(generation)) return;
+      await refreshAgentPanes();
+      if (!agentUiAlive(generation)) return;
+      addSystemMessage(`Closed tmux agent pane **${escapeApprovalText(session.name)}**.`);
+    } catch (error) {
+      if (!agentUiAlive(generation)) return;
+      agentRuntimeError = describeAgentError(error);
+      addSystemMessage(`Unable to close agent: ${escapeApprovalText(agentRuntimeError)}`);
+    }
+  }
+
+  async function sendAgentInput(id: string, value: string): Promise<void> {
+    const generation = agentOperationGeneration;
+    try {
+      await tmuxManager.sendInput(id, value, { enter: true });
+      if (!agentUiAlive(generation)) return;
+      await refreshAgentPanes();
+    } catch (error) {
+      if (!agentUiAlive(generation)) return;
+      agentRuntimeError = describeAgentError(error);
+      const view = agentViews.get(id);
+      if (view) view.output.content = `Input failed: ${escapeApprovalText(agentRuntimeError)}`;
+      renderer.requestRender();
+    }
+  }
+
+  function focusedAgentPane(): AgentPaneView | undefined {
+    return [...agentViews.values()].find(
+      (view) => renderer.currentFocusedRenderable === view.input,
+    );
+  }
+
+  async function interruptAgent(id: string): Promise<void> {
+    const generation = agentOperationGeneration;
+    try {
+      await tmuxManager.interrupt(id);
+      if (!agentUiAlive(generation)) return;
+      await refreshAgentPanes();
+    } catch (error) {
+      if (!agentUiAlive(generation)) return;
+      agentRuntimeError = describeAgentError(error);
+      const view = agentViews.get(id);
+      if (view) view.output.content = `Interrupt failed: ${escapeApprovalText(agentRuntimeError)}`;
+      renderer.requestRender();
     }
   }
 
@@ -904,7 +1635,11 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
 
   function syncLayout(): void {
     const compact = renderer.width < 100 || renderer.height < 26;
-    inspector.visible = !compact;
+    inspector.visible = !compact && !agentsVisible;
+    droneAgentDivider.visible = agentsVisible;
+    agentArea.visible = agentsVisible;
+    transcript.flexGrow = agentsVisible ? droneSplit : 1;
+    agentArea.flexGrow = agentsVisible ? 1 - droneSplit : 1;
     header.height = renderer.height < 18 ? 3 : config.ui.art === "full" ? 7 : 4;
     composerBox.height = renderer.height < 18 ? 3 : 5;
     art.width = renderer.width < 70 ? 15 : 23;
@@ -913,6 +1648,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
   }
 
   function syncView(): void {
+    if (renderer.isDestroyed) return;
     syncLayout();
     syncMessages();
     const artMode =
@@ -929,8 +1665,8 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     );
     art.fg = statusColor(state.status, palette);
     title.fg = statusColor(state.status, palette);
-    meta.content = `${config.provider}/${config.model}`;
-    submeta.content = `cwd  ${options.cwd}`;
+    meta.content = `${escapeApprovalText(config.provider)}/${escapeApprovalText(config.model)}`;
+    submeta.content = `cwd  ${escapeApprovalText(options.cwd)}`;
     inspectorTitle.content = `FLIGHT LOG · ${state.status.toUpperCase()}`;
     const tokens = (state.usage.inputTokens ?? 0) + (state.usage.outputTokens ?? 0);
     inspectorStats.content = `time ${formatDuration(state.durationMs)}  ·  tokens ${tokens || "—"}\nmouse ${renderer.useMouse ? "on" : "off"}  ·  policy ${config.runtime.requireApproval ? "ask" : "trusted"}`;
@@ -947,7 +1683,18 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
       : state.error
         ? `ERROR\n${state.error.slice(0, 320)}`
         : "";
-    footerStatus.content = isBusy(state)
+    const focusedAgent = [...agentViews.values()].find(
+      (view) => renderer.currentFocusedRenderable === view.input,
+    );
+    footerStatus.content = sessionPersistenceError
+      ? `history save failed · ${escapeApprovalText(sessionPersistenceError).slice(0, 96)}`
+      : panel === "history"
+      ? "↑/↓ choose · enter or click resumes · r refreshes · esc closes"
+      : agentsVisible && hiddenAgentSessions > 0
+        ? `showing ${agentSessions.length} agent pane${agentSessions.length === 1 ? "" : "s"} · ${hiddenAgentSessions} hidden · widen the split to reveal more`
+      : focusedAgent
+        ? `agent ${escapeApprovalText(focusedAgent.session.name)} · enter sends · ctrl+c interrupts · tab changes focus`
+      : isBusy(state)
       ? state.status === "approval"
         ? "waiting for your approval"
         : "esc cancels flight"
@@ -961,10 +1708,12 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     renderer.requestRender();
   }
 
-  function togglePanel(next: "help" | "config"): void {
+  function togglePanel(next: Exclude<Panel, "history">): void {
     panel = panel === next ? undefined : next;
     completion = undefined;
     renderCompletionMenu();
+    modalBody.visible = true;
+    historyViewport.visible = false;
     if (panel === "help") {
       modalTitle.content = "HELP / FLIGHT MANUAL";
       modalBody.content = HELP;
@@ -973,6 +1722,42 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
       syncConfigPanel();
     }
     syncView();
+    if (panel) modal.focus();
+    else composer.focus();
+  }
+
+  async function toggleHistoryPanel(): Promise<void> {
+    if (panel === "history") {
+      panel = undefined;
+      historyViewport.visible = false;
+      modalBody.visible = true;
+      syncView();
+      composer.focus();
+      return;
+    }
+    if (isBusy(state) || sessionTransitionPending) return;
+    sessionTransitionPending = true;
+    try {
+      const persisted = await persistSessionNow();
+      if (!persisted) {
+        sessionHistoryNotice = "The current session could not be checkpointed; history was not opened.";
+        if (!finished && !renderer.isDestroyed) syncView();
+        return;
+      }
+      if (isBusy(state) || finished) return;
+      panel = "history";
+      completion = undefined;
+      renderCompletionMenu();
+      modalTitle.content = "SESSION HISTORY / THIS WORKSPACE";
+      modalBody.visible = false;
+      historyViewport.visible = true;
+      modalHint.content = "Enter/click resumes · R refreshes · Esc closes";
+      syncView();
+      historyViewport.focus();
+    } finally {
+      sessionTransitionPending = false;
+    }
+    await refreshHistoryPanel();
   }
 
   function syncConfigPanel(): void {
@@ -1012,13 +1797,30 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
         { id: randomUUID(), role: "system", content, createdAt: Date.now() },
       ],
     };
+    scheduleSessionPersistence();
     syncView();
   }
 
-  function clearAll(): void {
-    if (isBusy(state)) return;
-    state = clearConversation(state);
-    syncView();
+  async function clearAll(): Promise<void> {
+    if (isBusy(state) || sessionTransitionPending) return;
+    sessionTransitionPending = true;
+    try {
+      const persisted = await persistSessionNow();
+      if (!persisted) {
+        sessionHistoryNotice = "The current session could not be checkpointed; clear was cancelled.";
+        if (!finished && !renderer.isDestroyed) syncView();
+        return;
+      }
+      if (isBusy(state) || finished) return;
+      sessionId = randomUUID();
+      sessionCreatedAt = Date.now();
+      sessionHistoryNotice = undefined;
+      state = clearConversation(state);
+      syncView();
+      composer.focus();
+    } finally {
+      sessionTransitionPending = false;
+    }
   }
 
   function decideApproval(approved: boolean, render = true): void {
@@ -1092,8 +1894,31 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
       togglePanel("config");
       return true;
     }
+    if (command === "history") {
+      await toggleHistoryPanel();
+      return true;
+    }
+    if (command === "agents") {
+      await toggleAgentPanes();
+      return true;
+    }
+    if (command === "spawn") {
+      const [name, ...commandParts] = args;
+      if (!name) {
+        addSystemMessage("Usage: `/spawn <name> [command]`");
+      } else {
+        await spawnAgent(name, commandParts.join(" ").trim() || undefined);
+      }
+      return true;
+    }
+    if (command === "close-agent") {
+      const name = args.join(" ").trim();
+      if (!name) addSystemMessage("Usage: `/close-agent <name>`");
+      else await closeAgent(name);
+      return true;
+    }
     if (command === "clear") {
-      clearAll();
+      await clearAll();
       return true;
     }
     if (command === "status") {
@@ -1164,6 +1989,12 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
   }
 
   async function submit(value: string): Promise<void> {
+    if (sessionTransitionPending) {
+      composer.replaceText(value);
+      composer.cursorOffset = value.length;
+      composer.focus();
+      return;
+    }
     if (isBusy(state)) {
       addSystemMessage("A flight is already active. Press Esc to cancel it first.");
       return;
@@ -1173,6 +2004,7 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     const prompt = assistantHistory(state, value);
     const turnId = randomUUID();
     state = addUserTurn(state, value, turnId);
+    scheduleSessionPersistence();
     activeAbort = new AbortController();
     activeDeadlineAt = Date.now() + config.timeoutMs;
     syncView();
@@ -1190,18 +2022,42 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
         host,
       )) {
         state = reduceStreamEvent(state, event);
-        syncView();
+        scheduleSessionPersistence();
+        if (!finished && !renderer.isDestroyed) syncView();
       }
     } finally {
       decideApproval(false, false);
       activeAbort = undefined;
       activeDeadlineAt = undefined;
       if (state.status !== "error") state = { ...state, status: "idle" };
+      scheduleSessionPersistence();
       if (!finished && !renderer.isDestroyed) {
         syncView();
         composer.focus();
         void refreshWorkspaceSources();
       }
+    }
+  }
+
+  function startSubmit(value: string): void {
+    let settlement: Promise<void>;
+    settlement = submit(value)
+      .catch((error: unknown) => {
+        if (finished || renderer.isDestroyed) return;
+        const message = error instanceof Error ? error.message : String(error);
+        state = { ...state, status: "error", error: message };
+        scheduleSessionPersistence();
+        syncView();
+      })
+      .finally(() => {
+        activeSubmitSettlements.delete(settlement);
+      });
+    activeSubmitSettlements.add(settlement);
+  }
+
+  async function settleActiveSubmits(): Promise<void> {
+    while (activeSubmitSettlements.size > 0) {
+      await Promise.all([...activeSubmitSettlements]);
     }
   }
 
@@ -1240,6 +2096,9 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     if (finished) return;
     finished = true;
     shutdownRequested = true;
+    agentOperationGeneration += 1;
+    tmuxAbortController.abort(new Error("Drone TUI stopped"));
+    stopAgentRefresh();
     cancelFlight();
     if (animationLive) {
       animationLive = false;
@@ -1253,6 +2112,9 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     if (shutdownRequested) return;
     rendererStoppedUnexpectedly = true;
     finished = true;
+    agentOperationGeneration += 1;
+    tmuxAbortController.abort(new Error("Drone renderer stopped"));
+    stopAgentRefresh();
     cancelFlight(false);
     exitResolve?.();
   }
@@ -1271,17 +2133,44 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
       return;
     }
     if (panel) {
-      if (key.name === "escape" || key.name === "?") panel = undefined;
-      else if (panel === "config" && key.name === "m") cycleConfig("motion");
-      else if (panel === "config" && key.name === "c") cycleConfig("mouseClicks");
-      else return;
+      if (panel === "history") {
+        const opens =
+          key.name === "return" || key.name === "enter" || key.name === "kpenter";
+        if (key.name === "escape") {
+          panel = undefined;
+          historyViewport.visible = false;
+          modalBody.visible = true;
+          composer.focus();
+        } else if (key.name === "up") {
+          moveHistorySelection(-1);
+        } else if (key.name === "down") {
+          moveHistorySelection(1);
+        } else if (key.name === "pageup") {
+          moveHistorySelection(-5);
+        } else if (key.name === "pagedown") {
+          moveHistorySelection(5);
+        } else if (key.name === "r") {
+          void refreshHistoryPanel();
+        } else if (opens) {
+          void loadHistorySession();
+        }
+      } else if (key.name === "escape" || key.name === "?") {
+        panel = undefined;
+        composer.focus();
+      } else if (panel === "config" && key.name === "m") {
+        cycleConfig("motion");
+      } else if (panel === "config" && key.name === "c") {
+        cycleConfig("mouseClicks");
+      }
       syncView();
       key.preventDefault();
       key.stopPropagation();
       return;
     }
     if (key.ctrl && key.name === "c") {
-      if (isBusy(state)) cancelFlight();
+      const agent = focusedAgentPane();
+      if (agent) void interruptAgent(agent.session.id);
+      else if (isBusy(state)) cancelFlight();
       else finish();
       key.preventDefault();
       key.stopPropagation();
@@ -1318,10 +2207,14 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
       return;
     }
     if (key.name === "pageup") {
-      transcript.scrollBy(-8);
+      const agent = focusedAgentPane();
+      if (agent) agent.outputViewport.scrollBy(-8);
+      else transcript.scrollBy(-8);
       key.preventDefault();
     } else if (key.name === "pagedown") {
-      transcript.scrollBy(8);
+      const agent = focusedAgentPane();
+      if (agent) agent.outputViewport.scrollBy(8);
+      else transcript.scrollBy(8);
       key.preventDefault();
     } else if (key.name === "?" && composer.plainText.length === 0) {
       togglePanel("help");
@@ -1331,8 +2224,13 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
 
   function handleRawInput(sequence: string): boolean {
     if (sequence === "\x03") {
-      if (isBusy(state)) cancelFlight();
+      const agent = focusedAgentPane();
+      if (agent) void interruptAgent(agent.session.id);
+      else if (isBusy(state)) cancelFlight();
       else finish();
+      return true;
+    }
+    if (panel && (sequence === "\t" || sequence === "\x1b[Z")) {
       return true;
     }
     if (
@@ -1347,14 +2245,31 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
     if (sequence === "\t" || sequence === "\x1b[Z") {
       completion = undefined;
       renderCompletionMenu();
-      if (renderer.currentFocusedRenderable === composer) transcript.focus();
-      else composer.focus();
+      const focusables = [
+        composer,
+        transcript,
+        ...(agentsVisible ? [...agentViews.values()].map((view) => view.input) : []),
+      ];
+      const current = focusables.findIndex(
+        (renderable) => renderer.currentFocusedRenderable === renderable,
+      );
+      const direction = sequence === "\x1b[Z" ? -1 : 1;
+      const next = (Math.max(0, current) + direction + focusables.length) % focusables.length;
+      focusables[next]?.focus();
+      syncView();
       return true;
     }
     return false;
   }
 
   lifecycleCleanup = () => {
+    agentOperationGeneration += 1;
+    tmuxAbortController.abort(new Error("Drone TUI cleanup"));
+    stopAgentRefresh();
+    if (sessionSaveTimer) {
+      clearTimeout(sessionSaveTimer);
+      sessionSaveTimer = undefined;
+    }
     decideApproval(false, false);
     activeAbort?.abort(new Error("Drone TUI stopped"));
     renderer.off(CliRenderEvents.DESTROY, handleRendererDestroy);
@@ -1398,9 +2313,11 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
   composer.focus();
   rendererStarted = true;
   renderer.start();
-  if (options.initialPrompt?.trim()) void submit(options.initialPrompt.trim());
+  if (options.initialPrompt?.trim()) startSubmit(options.initialPrompt.trim());
 
   await exited;
+  await settleActiveSubmits();
+  const finalSessionPersisted = await persistSessionNow();
   if (terminationSignal) {
     throw new DroneTuiSessionError(`Drone TUI terminated by ${terminationSignal}.`, {
       signal: terminationSignal,
@@ -1408,6 +2325,11 @@ export async function runDroneTui(options: DroneTuiOptions): Promise<void> {
   }
   if (rendererStoppedUnexpectedly) {
     throw new DroneTuiSessionError("Drone renderer stopped unexpectedly.");
+  }
+  if (!finalSessionPersisted || sessionPersistenceError) {
+    throw new DroneTuiSessionError(
+      `Drone could not save session history: ${sessionPersistenceError}`,
+    );
   }
   } catch (error) {
     if (error instanceof DroneTuiSessionError) throw error;
