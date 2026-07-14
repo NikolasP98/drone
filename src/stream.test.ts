@@ -131,4 +131,76 @@ describe("runDroneStream", () => {
     expect(events).toHaveLength(1);
     expect(events[0].type).toBe("error");
   });
+
+  it("falls back when the primary stream rejects before emitting output", async () => {
+    const drone = defineDrone({
+      ...baseDef,
+      model: {
+        provider: "anthropic",
+        model: "primary",
+        fallbacks: [{ provider: "openrouter", model: "fallback" }],
+      },
+    });
+    streamMock
+      .mockReturnValueOnce({
+        async *[Symbol.asyncIterator]() {},
+        result: async () => {
+          throw new Error("primary unavailable");
+        },
+      })
+      .mockReturnValueOnce(
+        fakeEventStream(["fallback ok"], asst([{ type: "text", text: "fallback ok" }], "stop")),
+      );
+
+    const events = await collect(runDroneStream(drone, { prompt: "hi" }, mockHost()));
+    expect(events).toEqual([
+      { type: "text", delta: "fallback ok" },
+      expect.objectContaining({
+        type: "done",
+        resolvedModel: { provider: "openrouter", model: "fallback" },
+      }),
+    ]);
+  });
+
+  it("treats resolved provider error messages as fallback failures", async () => {
+    const drone = defineDrone({
+      ...baseDef,
+      model: {
+        provider: "anthropic",
+        model: "primary",
+        fallbacks: [{ provider: "openrouter", model: "fallback" }],
+      },
+    });
+    const failed = {
+      ...asst([], "error"),
+      errorMessage: "rate limited",
+    } as AssistantMessage;
+    streamMock
+      .mockReturnValueOnce(fakeEventStream([], failed))
+      .mockReturnValueOnce(
+        fakeEventStream(["recovered"], asst([{ type: "text", text: "recovered" }], "stop")),
+      );
+
+    const events = await collect(runDroneStream(drone, { prompt: "hi" }, mockHost()));
+    expect(events.at(-1)).toMatchObject({
+      type: "done",
+      data: "recovered",
+      resolvedModel: { provider: "openrouter", model: "fallback" },
+    });
+  });
+
+  it("reports NO_API_KEY when no streaming candidate can resolve credentials", async () => {
+    const drone = defineDrone(baseDef);
+    const host: DroneHost = {
+      resolveApiKey: async () => {
+        throw new Error("missing");
+      },
+      resolveSkillsPrompt: () => "",
+    };
+    const events = await collect(runDroneStream(drone, { prompt: "hi" }, host));
+    expect(events).toEqual([
+      expect.objectContaining({ type: "error", error: expect.objectContaining({ code: "NO_API_KEY" }) }),
+    ]);
+    expect(streamMock).not.toHaveBeenCalled();
+  });
 });

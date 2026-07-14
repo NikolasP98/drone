@@ -1,5 +1,6 @@
 import { getModel, stream } from "@earendil-works/pi-ai";
 import type {
+  AssistantMessage,
   Context,
   Message,
   ProviderStreamOptions,
@@ -42,6 +43,14 @@ function interpolate(
 
 function err(code: DroneError["code"], message: string, cause?: unknown): DroneError {
   return { code, message, cause };
+}
+
+function sanitizeUpstreamError(message: string | undefined): string {
+  const normalized = message
+    ?.replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  return normalized ? normalized.slice(0, 1_000) : "provider returned no error details";
 }
 
 function anySignal(signals: Array<AbortSignal | undefined>): AbortSignal {
@@ -95,7 +104,41 @@ export async function* runDroneStream(
   const usage: DroneUsage = {};
 
   try {
-    const auth = await host.resolveApiKey(def.model);
+    type Candidate = {
+      spec: { provider: string; model: string };
+      apiKey: string;
+    };
+    const chain = [def.model, ...(def.model.fallbacks ?? [])];
+    const candidates: Candidate[] = [];
+    const authErrors: string[] = [];
+    for (const entry of chain) {
+      try {
+        const auth = await host.resolveApiKey(entry);
+        candidates.push({
+          spec: { provider: entry.provider, model: entry.model },
+          apiKey: auth.apiKey,
+        });
+      } catch (error) {
+        authErrors.push(`${entry.provider}/${entry.model}: ${String(error)}`);
+      }
+    }
+    if (candidates.length === 0) {
+      const durationMs = Date.now() - started;
+      const error = err(
+        "NO_API_KEY",
+        `Failed to resolve api key for any candidate (${authErrors.join("; ") || "no candidates"})`,
+      );
+      host.emitEvent?.({
+        event: "agent.run.error",
+        droneId: def.id,
+        correlationId,
+        durationMs,
+        errorCode: error.code,
+      });
+      yield { type: "error", error, durationMs };
+      return;
+    }
+
     const skillsBlock = host.resolveSkillsPrompt(def.skills);
     const systemPrompt = [interpolate(def.systemPrompt, input.context), skillsBlock]
       .filter((s) => s && s.trim().length > 0)
@@ -116,10 +159,6 @@ export async function* runDroneStream(
         : input.prompt;
     const messages: Message[] = [{ role: "user", content: userContent, timestamp: Date.now() }];
 
-    const model = getModel(def.model.provider as never, def.model.model as never) as Parameters<
-      typeof stream
-    >[0];
-    const resolvedModel = { provider: def.model.provider, model: def.model.model };
     const tools = def.tools ?? [];
     const maxSteps = def.maxSteps ?? (tools.length > 0 ? 4 : 1);
     const piTools = tools.map((t) => ({
@@ -128,27 +167,59 @@ export async function* runDroneStream(
       parameters: t.parameters,
     }));
     const toolMap = new Map(tools.map((t) => [t.name, t]));
-    const baseOptions: ProviderStreamOptions = {
-      apiKey: auth.apiKey,
-      signal,
-      maxTokens: input.maxTokens ?? 1024,
-      ...(input.temperature != null ? { temperature: input.temperature } : {}),
-      ...(piTools.length > 0 ? { tools: piTools as never } : {}),
-    };
 
     let finalText = "";
+    let lockedCandidate: Candidate | undefined;
+    let resolvedModel = candidates[0].spec;
     for (let step = 0; step < maxSteps; step++) {
       const ctx: Context = { systemPrompt, messages };
-      const eventStream = stream(model, ctx, baseOptions);
-      for await (const evt of eventStream) {
-        if (evt.type === "text_delta") {
-          yield { type: "text", delta: evt.delta };
-        } else if (evt.type === "thinking_delta") {
-          yield { type: "thinking", delta: evt.delta };
+      const pool = lockedCandidate ? [lockedCandidate] : candidates;
+      let final: AssistantMessage | undefined;
+      let lastError: unknown;
+
+      for (const candidate of pool) {
+        let emittedDelta = false;
+        try {
+          const model = getModel(
+            candidate.spec.provider as never,
+            candidate.spec.model as never,
+          ) as Parameters<typeof stream>[0];
+          const streamOptions: ProviderStreamOptions = {
+            apiKey: candidate.apiKey,
+            signal,
+            maxTokens: input.maxTokens ?? 1024,
+            ...(input.temperature != null ? { temperature: input.temperature } : {}),
+            ...(piTools.length > 0 ? { tools: piTools as never } : {}),
+          };
+          const eventStream = stream(model, ctx, streamOptions);
+          for await (const evt of eventStream) {
+            if (evt.type === "text_delta") {
+              emittedDelta = true;
+              yield { type: "text", delta: evt.delta };
+            } else if (evt.type === "thinking_delta") {
+              emittedDelta = true;
+              yield { type: "thinking", delta: evt.delta };
+            }
+          }
+          const candidateFinal = await eventStream.result();
+          if (candidateFinal.stopReason === "error" || candidateFinal.stopReason === "aborted") {
+            throw new Error(
+              `${candidate.spec.provider}/${candidate.spec.model} returned ${candidateFinal.stopReason}: ${sanitizeUpstreamError(candidateFinal.errorMessage)}`,
+            );
+          }
+          final = candidateFinal;
+          lockedCandidate = candidate;
+          resolvedModel = candidate.spec;
+          break;
+        } catch (error) {
+          lastError = error;
+          // Never replay a partially streamed answer, and never switch providers
+          // after a tool-loop conversation has been locked to one candidate.
+          if (signal.aborted || emittedDelta || lockedCandidate) throw error;
         }
       }
 
-      const final = await eventStream.result();
+      if (!final) throw lastError ?? new Error("all streaming candidates failed");
       messages.push(final);
       const u = final.usage;
       if (u) {
@@ -222,7 +293,7 @@ export async function* runDroneStream(
     yield {
       type: "error",
       error: err(
-        "UPSTREAM_ERROR",
+        "MAX_STEPS_EXCEEDED",
         `drone "${def.id}" exceeded ${maxSteps} steps without final reply`,
       ),
       durationMs: Date.now() - started,
