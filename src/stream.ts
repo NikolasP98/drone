@@ -1,4 +1,4 @@
-import { getModel, stream } from "@earendil-works/pi-ai";
+import { getModel, stream } from "@earendil-works/pi-ai/compat";
 import type {
   AssistantMessage,
   Context,
@@ -6,7 +6,7 @@ import type {
   ProviderStreamOptions,
   ToolCall,
   ToolResultMessage,
-} from "@earendil-works/pi-ai";
+} from "@earendil-works/pi-ai/compat";
 import { Value } from "@sinclair/typebox/value";
 import type {
   Drone,
